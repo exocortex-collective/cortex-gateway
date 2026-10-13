@@ -22,7 +22,7 @@ from __future__ import annotations
 import pytest
 from flask import Flask, jsonify
 
-from gateway.auth import _is_preview, _ui_route_allowed, init_auth
+from gateway.auth import _ui_route_allowed, init_auth, is_preview
 
 API_TOKEN = "api-token-fixture"
 UI_TOKEN = "ui-token-fixture"
@@ -230,4 +230,4 @@ class TestTheAllowlistItself:
         [("1", True), ("true", True), ("YES", True), ("0", False), (None, False)],
     )
     def test_preview_parsing(self, raw, expected):
-        assert _is_preview({"preview": raw} if raw is not None else {}) is expected
+        assert is_preview({"preview": raw} if raw is not None else {}) is expected

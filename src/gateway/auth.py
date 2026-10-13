@@ -161,11 +161,11 @@ def _ui_route_allowed(method: str, path: str, args: Any) -> bool:
     if (method, path) in UI_ALLOWED_EXACT:
         return True
     if method == "POST" and path == "/triage/rerun":
-        return _is_preview(args)
+        return is_preview(args)
     return any(m == method and pat.match(path) for m, pat in UI_ALLOWED_PATTERNS)
 
 
-def _is_preview(args: Any) -> bool:
+def is_preview(args: Any) -> bool:
     """A truthy ?preview= value. "0" and "false" do not count."""
     raw = (args.get("preview") or "").strip().lower()
     return raw in ("1", "true", "yes")
@@ -447,4 +447,4 @@ def _presented_token(headers: Any) -> str:
     return direct.strip()
 
 
-__all__ = ["init_auth", "is_internal"]
+__all__ = ["init_auth", "is_internal", "is_preview"]

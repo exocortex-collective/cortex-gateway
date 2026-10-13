@@ -1,10 +1,13 @@
 """Triage-related API endpoints."""
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from flask import Blueprint, jsonify, request
 
+from gateway.auth import is_preview
 from gateway.services import postgres
+from gateway.services.postgres import ConnectionContext
 
 triage_bp = Blueprint("triage", __name__)
 
@@ -87,9 +90,18 @@ def rerun_triage():
     senders = [s for s in senders_raw or [] if s]
 
     label = data.get("label")
-    days = data.get("days", 7)
     force = data.get("force", False)
+
+    # days and priority were previously unvalidated. A string `days` reached
+    # timedelta(days="7") and raised TypeError, which Flask turned into a 500
+    # -- a caller error reported as a server fault. bool is excluded because
+    # isinstance(True, int) is True and `days: true` would mean one day.
+    days = data.get("days", 7)
+    if isinstance(days, bool) or not isinstance(days, int) or days < 1:
+        return jsonify({"error": "'days' must be an integer >= 1"}), 400
     priority = data.get("priority", -100)
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        return jsonify({"error": "'priority' must be an integer"}), 400
 
     if not gmail_ids and not label and not senders:
         return jsonify({"error": "Must specify gmail_ids, label, or senders filter"}), 400
@@ -117,7 +129,13 @@ def rerun_triage():
             FROM emails_raw er
             WHERE er.gmail_id IN ({placeholders})
         """
-        params: list[str | int] = [priority] + gmail_ids
+        # list[Any], not list[str | int]: a list is INVARIANT, so the later
+        # branches assigning list[int] and list[object] are rejected against
+        # the narrower annotation. That only started failing once `priority`
+        # was validated to int above -- while it was Any, every branch
+        # inferred list[Any] and agreed by accident. Caught by the pre-commit
+        # mypy (1.5.1), not by the newer one in this venv.
+        params: list[Any] = [priority] + gmail_ids
     elif senders:
         # Sender filter with date range - join with emails_parsed to filter by from_addr
         cutoff = datetime.now(UTC) - timedelta(days=days)
@@ -184,10 +202,40 @@ def rerun_triage():
     # Handle any race conditions with existing queue entries
     query += " ON CONFLICT DO NOTHING"
 
+    # PREVIEW RUNS THE REAL STATEMENT AND ROLLS IT BACK, rather than
+    # rewriting it into a COUNT. The statement carries DISTINCT ON, a
+    # NOT EXISTS de-duplication and ON CONFLICT DO NOTHING; a hand-built
+    # count would have to restate all three and would drift from them on the
+    # next edit, reporting a number the real call does not produce. Executing
+    # and discarding is exact by construction.
+    #
+    # It consumes sequence values, which are not rolled back. Harmless: the
+    # queue's id is a surrogate and gaps mean nothing.
+    if is_preview(request.args):
+        with ConnectionContext() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, tuple(params))
+                count = cur.rowcount
+            conn.rollback()
+        return jsonify(
+            {
+                "preview": True,
+                "message": f"Would enqueue {count} emails for triage rerun",
+                "gmail_ids": gmail_ids if gmail_ids else None,
+                "label": label,
+                "senders": senders if senders else None,
+                "days": days if not gmail_ids else None,
+                "force": force,
+                "priority": priority,
+                "count": count,
+            }
+        )
+
     count = postgres.execute_update(query, tuple(params))
 
     return jsonify(
         {
+            "preview": False,
             "message": f"Enqueued {count} emails for triage rerun",
             "gmail_ids": gmail_ids if gmail_ids else None,
             "label": label,
