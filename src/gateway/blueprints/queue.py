@@ -39,10 +39,9 @@ def _ref(payload: Any) -> str | None:
 def _page_limit() -> int:
     """A usable page size, clamped at both ends.
 
-    Only the upper bound was clamped, so ?limit=0 and ?limit=-1 passed
-    straight through to LIMIT and Postgres rejected the negative one as a 500.
-    Flask's type=int already returns the default for a non-numeric value
-    (measured: ?limit=abc gives 50), so no None case needs handling here.
+    Flask's type=int already returns the default for a non-numeric value, so
+    there is no None case to handle; both bounds are clamped because LIMIT 0
+    returns nothing and Postgres rejects a negative one outright.
     """
     return max(1, min(request.args.get("limit", 50, type=int), BULK_MAX))
 
@@ -72,18 +71,21 @@ def _bulk(
     act: Callable[[DeadLetterManager, int], dict[str, Any]],
     action: str,
 ) -> list[dict[str, Any]]:
-    """Run a per-id action, committing each one on its own.
+    """Run a per-id action and report each id's outcome.
 
-    Both routes promise per-item results, and a single transaction cannot keep
-    that promise: one id raising discarded every result AND rolled back the
-    ids that had already succeeded. Per-id commits mean a failure costs that
-    id only. Bounded by BULK_MAX, so this is at most 100 commits on an
-    operator action.
+    Both routes promise per-item results, and without this an id that raised
+    took the whole call to a 500 -- losing every result, including the ids
+    that had already been applied. DeadLetterManager.retry_job and .dismiss
+    each commit for themselves, so there is nothing to commit here; what is
+    needed is that one bad id costs that id only.
 
-    An id that raises is reported like any other failure rather than becoming
-    a 500, and the rollback keeps the connection usable -- after an error
-    psycopg2 refuses every later statement on that transaction, so without it
-    one bad id would fail all the ids behind it.
+    The rollback is for the connection, not the data: after an error psycopg2
+    refuses every later statement on the transaction, so without it one bad
+    id would fail all the ids behind it. It is guarded because a rollback on
+    an already-closed connection raises, and that exception would escape past
+    ConnectionContext.__exit__ -- which rolls back again, raises again, and
+    never reaches put_connection, leaking the pool slot and skipping the
+    audit line below even though ids had been applied.
     """
     results: list[dict[str, Any]] = []
     with ConnectionContext() as conn:
@@ -91,15 +93,29 @@ def _bulk(
         for dead_id in ids:
             try:
                 results.append(act(manager, dead_id))
-                conn.commit()
             except Exception as exc:
-                conn.rollback()
+                try:
+                    conn.rollback()
+                except Exception as rollback_exc:
+                    logger.warning(
+                        "queue_bulk_rollback_failed",
+                        action=action,
+                        dead_id=dead_id,
+                        error_type=type(rollback_exc).__name__,
+                    )
+                # The message is not logged: a psycopg2 error carries a DETAIL
+                # line holding the offending row's values.
                 logger.warning(
-                    "queue_bulk_item_failed", action=action, dead_id=dead_id, error=str(exc)
+                    "queue_bulk_item_failed",
+                    action=action,
+                    dead_id=dead_id,
+                    error_type=type(exc).__name__,
                 )
                 results.append({"id": dead_id, "ok": False, "why": "error, see gateway logs"})
     moved = [r["id"] for r in results if r["ok"]]
-    # The only record that a browser credential moved dead letters, and which.
+    # The gateway's own record of a bulk mutation and its caller. The
+    # dead-letter rows also show what moved; this shows who asked and when,
+    # and is the only place a request that moved nothing appears at all.
     logger.info(
         "queue_bulk_action",
         action=action,

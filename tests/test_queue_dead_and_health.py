@@ -217,6 +217,50 @@ class TestResponseShapes:
         assert set(body) == {"dead", "limit", "count"}
         assert set(body["dead"][0]) == self.DEAD_KEYS
 
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_each_dead_field_is_wired_to_its_own_source(self, mgr, conn, client):
+        """Keys alone do not pin the wiring.
+
+        The fixture gave created_at and failed_at the same value and both
+        dismissed_at and retried_at None, so swapping either pair passed. A
+        distinct value per field is what makes a swap visible -- and these are
+        timestamps the UI shows, so a swap is a wrong answer, not a cosmetic
+        one.
+        """
+        row = _dead_row(
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            failed_at=datetime(2026, 2, 2, tzinfo=UTC),
+            dismissed_at=datetime(2026, 3, 3, tzinfo=UTC),
+            retried_at=datetime(2026, 4, 4, tzinfo=UTC),
+            retried_as=4242,
+            attempts=7,
+        )
+        mgr.return_value.list_jobs.return_value = [row]
+        d = client.get("/queue/dead").get_json()["dead"][0]
+
+        assert d["id"] == row["id"]
+        assert d["original_id"] == row["original_id"]
+        assert d["queue"] == row["queue_name"]
+        assert d["ref"] == "19ae00"
+        assert d["attempts"] == 7
+        assert d["error"] == row["last_error"]
+        # flask.jsonify emits RFC-822, not ISO, with no custom provider --
+        # the UI contract calls this out, so the assertion matches the wire
+        # format the extension actually parses.
+        assert "01 Jan 2026" in d["created_at"]
+        assert "02 Feb 2026" in d["failed_at"]
+        assert "03 Mar 2026" in d["dismissed_at"]
+        assert "04 Apr 2026" in d["retried_at"]
+        assert d["retried_as"] == 4242
+
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_count_is_the_rows_returned_and_limit_is_the_limit(self, mgr, conn, client):
+        """count wired to limit, and a changed default, both passed before."""
+        mgr.return_value.list_jobs.return_value = [_dead_row(1), _dead_row(2)]
+        body = client.get("/queue/dead").get_json()
+        assert body["count"] == 2
+        assert body["limit"] == 50, "the documented default page size"
+
     @patch("gateway.blueprints.queue.queue_inspect")
     def test_a_stuck_row_carries_exactly_the_contract_keys(self, qi, conn, client):
         qi.stuck.return_value = [
@@ -286,11 +330,11 @@ class TestBulkActions:
     def test_each_requested_id_reaches_the_manager(self, mgr, conn, client):
         """WHICH id, not just how many.
 
-        The other tests drive the manager with side_effect lists, so results
-        depend on call order and not on the argument: measured, replacing
-        retry_job(dead_id) with retry_job(ids[0]) left the suite at 206. On a
-        destructive bulk route the browser token can call, acting on an id the
-        caller did not name is the whole risk.
+        The other tests drive the manager with side_effect lists, so their
+        results depend on call order rather than on the argument, and
+        retry_job(ids[0]) passed them all. On a destructive bulk route the
+        browser token can call, acting on an id the caller did not name is
+        the whole risk.
         """
         m = mgr.return_value
         m.retry_job.return_value = True
@@ -316,6 +360,57 @@ class TestBulkActions:
         client.post("/queue/dead/dismiss", json={"ids": [7, 8, 9]})
         assert mgr.return_value.dismiss.call_args_list == [call(7), call(8), call(9)]
 
+    @patch("gateway.blueprints.queue.logger")
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_the_bulk_action_is_audited(self, mgr, log, conn, client):
+        """The audit line is the justification for the whole helper.
+
+        Deleting it, or including failed ids in `moved`, or blanking
+        remote_addr, all passed before this.
+        """
+        m = mgr.return_value
+        m.retry_job.side_effect = [True, False]
+        m.get_job.return_value = {"retried_as": 1}
+        m.why_not_retryable.return_value = "already retried"
+
+        client.post("/queue/dead/resubmit", json={"ids": [7, 8]})
+        events = {c.args[0]: c.kwargs for c in log.info.call_args_list}
+        assert "queue_bulk_action" in events
+        fields = events["queue_bulk_action"]
+        assert fields["action"] == "resubmit"
+        assert fields["requested"] == [7, 8]
+        assert fields["moved"] == [7], "only the ids that actually moved"
+        assert fields["failed"] == [8]
+        assert fields["remote_addr"]
+
+    @patch("gateway.blueprints.queue.logger")
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_a_raising_id_is_audited_without_its_error_message(self, mgr, log, conn, client):
+        """A psycopg2 message carries a DETAIL line holding row values."""
+        mgr.return_value.retry_job.side_effect = RuntimeError("DETAIL: Key (x)=(secret)")
+        client.post("/queue/dead/resubmit", json={"ids": [7]})
+        warnings = {c.args[0]: c.kwargs for c in log.warning.call_args_list}
+        assert warnings["queue_bulk_item_failed"]["error_type"] == "RuntimeError"
+        assert not any("secret" in str(v) for v in warnings["queue_bulk_item_failed"].values())
+
+    @patch("gateway.blueprints.queue.logger")
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_a_failing_rollback_still_returns_the_connection(self, mgr, log, conn, client):
+        """Unguarded, this leaked a pool slot and skipped the audit line.
+
+        The rollback raising escaped _bulk, and ConnectionContext.__exit__
+        then rolled back again, raised again, and never reached
+        put_connection -- while ids had already been applied.
+        """
+        mgr.return_value.retry_job.side_effect = RuntimeError("boom")
+        conn.rollback.side_effect = RuntimeError("connection already closed")
+
+        r = client.post("/queue/dead/resubmit", json={"ids": [7]})
+        assert r.status_code == 200
+        assert r.get_json()["results"][0]["ok"] is False
+        assert "queue_bulk_rollback_failed" in {c.args[0] for c in log.warning.call_args_list}
+        assert "queue_bulk_action" in {c.args[0] for c in log.info.call_args_list}
+
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_one_raising_id_does_not_discard_the_others(self, mgr, conn, client):
         """The route promises per-item results, so one bad id must cost one id.
@@ -336,16 +431,22 @@ class TestBulkActions:
         assert conn.rollback.called, "the failed id must not poison the transaction"
 
     @patch("gateway.blueprints.queue.DeadLetterManager")
-    def test_both_bulk_routes_commit(self, mgr, conn, client):
-        """Without the commit the retry is rolled back by the pool teardown."""
+    def test_the_gateway_does_not_commit_because_the_manager_does(self, mgr, conn, client):
+        """DeadLetterManager.retry_job and .dismiss each commit for themselves.
+
+        An earlier version of this test asserted the gateway committed, which
+        pinned a redundant call: cortex_utils commits inside retry_job
+        (dead_letter.py) and dismiss, so a commit here was a second one on an
+        already-committed transaction. Asserting the absence keeps someone
+        from re-adding it on the strength of the old docstring.
+        """
         mgr.return_value.retry_job.return_value = True
         mgr.return_value.get_job.return_value = {"retried_as": 1}
         client.post("/queue/dead/resubmit", json={"ids": [1]})
-        assert conn.commit.called
-        conn.commit.reset_mock()
+        assert not conn.commit.called
         mgr.return_value.dismiss.return_value = True
         client.post("/queue/dead/dismiss", json={"ids": [1]})
-        assert conn.commit.called
+        assert not conn.commit.called
 
     @pytest.mark.parametrize(
         "body,why",

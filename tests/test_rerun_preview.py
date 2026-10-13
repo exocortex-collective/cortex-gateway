@@ -14,6 +14,7 @@ query string.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -50,21 +51,57 @@ class TestPreview:
         assert conn.rollback.called
         assert not conn.commit.called
 
-    def test_preview_actually_executes_the_statement(self, conn, client):
-        """The count is only exact because the real statement ran.
+    def test_preview_executes_the_same_statement_the_real_path_would(self, conn, client):
+        """The count is exact only if the preview runs the REAL statement.
 
-        rowcount comes from the fixture, so every other assertion here passes
-        with `cur.execute` deleted -- measured, the suite stayed at 206. A
-        preview that runs nothing and reports a number is worse than no
-        preview, because the number looks authoritative.
+        Substring checks are not enough: a dummy execute carrying the same
+        two substrings, a reversed parameter tuple, a truncated one, and a
+        second execute call all passed an earlier version of this test. So
+        the statement and its parameters are compared against what the
+        non-preview path builds for the same request, which is the only
+        definition of "the real statement" that means anything.
+        """
+        body = {"senders": ["*@example.com"], "days": 3, "priority": -50}
+        # The senders branch derives a cutoff from now(), so the two requests
+        # would otherwise differ by the microseconds between them.
+        frozen = datetime(2026, 10, 13, 12, 0, 0, tzinfo=UTC)
+        with patch("gateway.blueprints.triage.datetime") as dt:
+            dt.now.return_value = frozen
+            client.post("/triage/rerun?preview=1", json=body)
+            cur = conn.cursor.return_value.__enter__.return_value
+            assert cur.execute.call_count == 1, "exactly once: twice would double the count"
+            preview_sql, preview_params = cur.execute.call_args[0]
+
+            with patch("gateway.blueprints.triage.postgres.execute_update") as real:
+                real.return_value = 0
+                client.post("/triage/rerun", json=body)
+            real_sql, real_params = real.call_args[0]
+
+        assert preview_sql == real_sql
+        assert preview_params == real_params
+        assert isinstance(preview_params, tuple) and preview_params
+
+    @patch("gateway.blueprints.triage.logger")
+    def test_preview_is_distinguishable_from_a_real_enqueue_in_the_log(self, log, conn, client):
+        """An operator reading a count needs to know whether rows landed.
+
+        Deleting either log line passed before this.
         """
         client.post("/triage/rerun?preview=1", json={"senders": ["*@example.com"]})
-        cur = conn.cursor.return_value.__enter__.return_value
-        assert cur.execute.called, "the preview must run the real statement"
-        sql, params = cur.execute.call_args[0]
-        assert "INSERT INTO queue" in sql
-        assert "ON CONFLICT DO NOTHING" in sql
-        assert params, "bound parameters must reach the statement"
+        events = [c for c in log.info.call_args_list if c.args[0] == "triage_rerun"]
+        assert len(events) == 1
+        assert events[0].kwargs["preview"] is True
+        assert events[0].kwargs["count"] == 412
+
+    @patch("gateway.blueprints.triage.logger")
+    @patch("gateway.blueprints.triage.postgres.execute_update")
+    def test_a_real_enqueue_is_logged_as_not_a_preview(self, mock_update, log, client):
+        mock_update.return_value = 9
+        client.post("/triage/rerun", json={"senders": ["*@example.com"]})
+        events = [c for c in log.info.call_args_list if c.args[0] == "triage_rerun"]
+        assert len(events) == 1
+        assert events[0].kwargs["preview"] is False
+        assert events[0].kwargs["count"] == 9
 
     @patch("gateway.blueprints.triage.postgres.execute_update")
     def test_preview_never_takes_the_committing_path(self, mock_update, conn, client):
