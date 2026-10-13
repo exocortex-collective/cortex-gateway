@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from flask import Flask
@@ -187,6 +187,77 @@ class TestStuck:
         assert mock_stuck.call_args.kwargs["limit"] == BULK_MAX
 
 
+class TestResponseShapes:
+    """The extension reads these keys, so a dropped one breaks the UI silently.
+
+    Measured before this: removing dismissed_at or retried_as from a dead row,
+    or limit from the /queue/stuck body, left the whole suite green. The
+    contract names them, so they are pinned as a set rather than individually.
+    """
+
+    DEAD_KEYS = {
+        "id",
+        "original_id",
+        "queue",
+        "ref",
+        "attempts",
+        "error",
+        "created_at",
+        "failed_at",
+        "dismissed_at",
+        "retried_at",
+        "retried_as",
+    }
+    STUCK_KEYS = {"id", "queue", "claimed_by", "claimed_at", "stuck_for_s", "attempts"}
+
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_a_dead_row_carries_exactly_the_contract_keys(self, mgr, conn, client):
+        mgr.return_value.list_jobs.return_value = [_dead_row()]
+        body = client.get("/queue/dead").get_json()
+        assert set(body) == {"dead", "limit", "count"}
+        assert set(body["dead"][0]) == self.DEAD_KEYS
+
+    @patch("gateway.blueprints.queue.queue_inspect")
+    def test_a_stuck_row_carries_exactly_the_contract_keys(self, qi, conn, client):
+        qi.stuck.return_value = [
+            SimpleNamespace(
+                id=1,
+                queue_name="triage",
+                claimed_by="worker-1",
+                claimed_at=datetime(2026, 10, 13, tzinfo=UTC),
+                stuck_for_s=900,
+                attempts=1,
+            )
+        ]
+        body = client.get("/queue/stuck").get_json()
+        assert set(body) == {"stuck", "limit", "count"}
+        assert set(body["stuck"][0]) == self.STUCK_KEYS
+
+
+class TestPageLimits:
+    """Both bounds. Only the upper one was clamped, and only it was tested.
+
+    ?limit=0 and ?limit=-1 reached Postgres as LIMIT 0 / LIMIT -1, the second
+    of which it rejects -- a 500 from a query string.
+    """
+
+    LIMITS = [("0", 1), ("-1", 1), ("7", 7), ("500", 100)]
+
+    @pytest.mark.parametrize("raw,expected", LIMITS)
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_dead_limit_is_clamped_at_both_ends(self, mgr, conn, client, raw, expected):
+        mgr.return_value.list_jobs.return_value = []
+        client.get(f"/queue/dead?limit={raw}")
+        assert mgr.return_value.list_jobs.call_args.kwargs["limit"] == expected
+
+    @pytest.mark.parametrize("raw,expected", LIMITS)
+    @patch("gateway.blueprints.queue.queue_inspect")
+    def test_stuck_limit_is_clamped_at_both_ends(self, qi, conn, client, raw, expected):
+        qi.stuck.return_value = []
+        client.get(f"/queue/stuck?limit={raw}")
+        assert qi.stuck.call_args.kwargs["limit"] == expected
+
+
 class TestBulkActions:
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_a_mixed_outcome_is_200_with_per_item_results(self, mgr, conn, client):
@@ -210,6 +281,59 @@ class TestBulkActions:
         data = client.post("/queue/dead/dismiss", json={"ids": [1, 2]}).get_json()
         assert data["dismissed"] == 1
         assert "no dead letter job with id 2" in data["results"][1]["why"]
+
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_each_requested_id_reaches_the_manager(self, mgr, conn, client):
+        """WHICH id, not just how many.
+
+        The other tests drive the manager with side_effect lists, so results
+        depend on call order and not on the argument: measured, replacing
+        retry_job(dead_id) with retry_job(ids[0]) left the suite at 206. On a
+        destructive bulk route the browser token can call, acting on an id the
+        caller did not name is the whole risk.
+        """
+        m = mgr.return_value
+        m.retry_job.return_value = True
+        m.get_job.return_value = {"retried_as": 1}
+
+        client.post("/queue/dead/resubmit", json={"ids": [7, 8, 9]})
+        assert m.retry_job.call_args_list == [call(7), call(8), call(9)]
+        assert m.get_job.call_args_list == [call(7), call(8), call(9)]
+
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_a_failed_id_is_explained_for_that_id(self, mgr, conn, client):
+        """why_not_retryable must be asked about the id that failed."""
+        m = mgr.return_value
+        m.retry_job.side_effect = [False, False]
+        m.why_not_retryable.return_value = "nope"
+
+        client.post("/queue/dead/resubmit", json={"ids": [7, 8]})
+        assert m.why_not_retryable.call_args_list == [call(7), call(8)]
+
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_each_dismissed_id_reaches_the_manager(self, mgr, conn, client):
+        mgr.return_value.dismiss.return_value = True
+        client.post("/queue/dead/dismiss", json={"ids": [7, 8, 9]})
+        assert mgr.return_value.dismiss.call_args_list == [call(7), call(8), call(9)]
+
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_one_raising_id_does_not_discard_the_others(self, mgr, conn, client):
+        """The route promises per-item results, so one bad id must cost one id.
+
+        In a single transaction a raise discarded every result and rolled back
+        the ids that had already succeeded, turning a partial success into a
+        500 with no information.
+        """
+        m = mgr.return_value
+        m.retry_job.side_effect = [True, RuntimeError("boom"), True]
+        m.get_job.return_value = {"retried_as": 1}
+
+        r = client.post("/queue/dead/resubmit", json={"ids": [1, 2, 3]})
+        assert r.status_code == 200
+        data = r.get_json()
+        assert [x["ok"] for x in data["results"]] == [True, False, True]
+        assert data["resubmitted"] == 2
+        assert conn.rollback.called, "the failed id must not poison the transaction"
 
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_both_bulk_routes_commit(self, mgr, conn, client):

@@ -1,7 +1,9 @@
 """Queue management API endpoints."""
 
+from collections.abc import Callable
 from typing import Any
 
+from cortex_utils.logging import get_logger
 from cortex_utils.queue import DeadLetterManager
 from cortex_utils.queue import inspect as queue_inspect
 from flask import Blueprint, Response, jsonify, request
@@ -10,6 +12,7 @@ from gateway.services import postgres
 from gateway.services.postgres import ConnectionContext
 
 queue_bp = Blueprint("queue", __name__)
+logger = get_logger()
 
 # A bulk action's id list is capped so one request cannot walk the whole
 # dead-letter table. Matches cryo's QUEUE_PAGE_MAX, because the extension
@@ -33,9 +36,25 @@ def _ref(payload: Any) -> str | None:
     return None
 
 
+def _page_limit() -> int:
+    """A usable page size, clamped at both ends.
+
+    Only the upper bound was clamped, so ?limit=0 and ?limit=-1 passed
+    straight through to LIMIT and Postgres rejected the negative one as a 500.
+    Flask's type=int already returns the default for a non-numeric value
+    (measured: ?limit=abc gives 50), so no None case needs handling here.
+    """
+    return max(1, min(request.args.get("limit", 50, type=int), BULK_MAX))
+
+
 def _requested_ids() -> tuple[list[int] | None, str | None]:
     """The `ids` list from a bulk body, or (None, error message)."""
-    body = request.get_json(silent=True) or {}
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        # get_json(silent=True) returns whatever JSON was sent, so a bare list
+        # or string reached .get() and raised, turning a client mistake into a
+        # 500 with a traceback in the log.
+        return None, "body must be a JSON object with an 'ids' list"
     raw = body.get("ids")
     if not isinstance(raw, list) or not raw:
         return None, "ids must be a non-empty list of integers"
@@ -46,6 +65,50 @@ def _requested_ids() -> tuple[list[int] | None, str | None]:
         # become dead-letter id 1 -- an unrelated payload resurrected.
         return None, "ids must all be integers"
     return list(raw), None
+
+
+def _bulk(
+    ids: list[int],
+    act: Callable[[DeadLetterManager, int], dict[str, Any]],
+    action: str,
+) -> list[dict[str, Any]]:
+    """Run a per-id action, committing each one on its own.
+
+    Both routes promise per-item results, and a single transaction cannot keep
+    that promise: one id raising discarded every result AND rolled back the
+    ids that had already succeeded. Per-id commits mean a failure costs that
+    id only. Bounded by BULK_MAX, so this is at most 100 commits on an
+    operator action.
+
+    An id that raises is reported like any other failure rather than becoming
+    a 500, and the rollback keeps the connection usable -- after an error
+    psycopg2 refuses every later statement on that transaction, so without it
+    one bad id would fail all the ids behind it.
+    """
+    results: list[dict[str, Any]] = []
+    with ConnectionContext() as conn:
+        manager = DeadLetterManager(conn)
+        for dead_id in ids:
+            try:
+                results.append(act(manager, dead_id))
+                conn.commit()
+            except Exception as exc:
+                conn.rollback()
+                logger.warning(
+                    "queue_bulk_item_failed", action=action, dead_id=dead_id, error=str(exc)
+                )
+                results.append({"id": dead_id, "ok": False, "why": "error, see gateway logs"})
+    moved = [r["id"] for r in results if r["ok"]]
+    # The only record that a browser credential moved dead letters, and which.
+    logger.info(
+        "queue_bulk_action",
+        action=action,
+        requested=ids,
+        moved=moved,
+        failed=[r["id"] for r in results if not r["ok"]],
+        remote_addr=request.remote_addr,
+    )
+    return results
 
 
 @queue_bp.route("/health")
@@ -91,7 +154,7 @@ def dead_letters() -> Response:
     a truncated LLM response is retried to max_attempts and archived here,
     and nothing surfaced it.
     """
-    limit = min(request.args.get("limit", 50, type=int), BULK_MAX)
+    limit = _page_limit()
     include_resolved = request.args.get("include_resolved", "").lower() in (
         "1",
         "true",
@@ -125,8 +188,13 @@ def dead_letters() -> Response:
 
 @queue_bp.route("/stuck")
 def stuck_jobs() -> Response:
-    """Claimed and never completed -- a worker died holding the claim."""
-    limit = min(request.args.get("limit", 50, type=int), BULK_MAX)
+    """Claimed and still unfinished past the visibility window.
+
+    A dead worker is the usual cause but not the only one: the query is a
+    status and an age, so a live worker slower than the window is in here
+    too. Read it as "look at these", not as "these are abandoned".
+    """
+    limit = _page_limit()
     with ConnectionContext() as conn:
         jobs = queue_inspect.stuck(conn, limit=limit)
     return jsonify(
@@ -157,32 +225,16 @@ def resubmit_dead() -> Response | tuple[Response, int]:
     UI nothing about which ids moved.
     """
     ids, error = _requested_ids()
-    if error:
+    if ids is None:
         return jsonify({"error": error}), 400
-    assert ids is not None
 
-    results = []
-    with ConnectionContext() as conn:
-        manager = DeadLetterManager(conn)
-        for dead_id in ids:
-            if manager.retry_job(dead_id):
-                job = manager.get_job(dead_id)
-                results.append(
-                    {
-                        "id": dead_id,
-                        "ok": True,
-                        "new_id": job["retried_as"] if job else None,
-                    }
-                )
-            else:
-                results.append(
-                    {
-                        "id": dead_id,
-                        "ok": False,
-                        "why": manager.why_not_retryable(dead_id),
-                    }
-                )
-        conn.commit()
+    def _one(manager: DeadLetterManager, dead_id: int) -> dict[str, Any]:
+        if not manager.retry_job(dead_id):
+            return {"id": dead_id, "ok": False, "why": manager.why_not_retryable(dead_id)}
+        job = manager.get_job(dead_id)
+        return {"id": dead_id, "ok": True, "new_id": job["retried_as"] if job else None}
+
+    results = _bulk(ids, _one, "resubmit")
     return jsonify({"results": results, "resubmitted": sum(1 for r in results if r["ok"])})
 
 
@@ -194,20 +246,15 @@ def dismiss_dead() -> Response | tuple[Response, int]:
     buried in things nobody intends to act on.
     """
     ids, error = _requested_ids()
-    if error:
+    if ids is None:
         return jsonify({"error": error}), 400
-    assert ids is not None
 
-    results = []
-    with ConnectionContext() as conn:
-        manager = DeadLetterManager(conn)
-        for dead_id in ids:
-            ok = manager.dismiss(dead_id)
-            entry: dict[str, Any] = {"id": dead_id, "ok": ok}
-            if not ok:
-                entry["why"] = f"no dead letter job with id {dead_id}"
-            results.append(entry)
-        conn.commit()
+    def _one(manager: DeadLetterManager, dead_id: int) -> dict[str, Any]:
+        if manager.dismiss(dead_id):
+            return {"id": dead_id, "ok": True}
+        return {"id": dead_id, "ok": False, "why": f"no dead letter job with id {dead_id}"}
+
+    results = _bulk(ids, _one, "dismiss")
     return jsonify({"results": results, "dismissed": sum(1 for r in results if r["ok"])})
 
 

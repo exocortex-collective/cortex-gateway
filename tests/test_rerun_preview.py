@@ -50,6 +50,28 @@ class TestPreview:
         assert conn.rollback.called
         assert not conn.commit.called
 
+    def test_preview_actually_executes_the_statement(self, conn, client):
+        """The count is only exact because the real statement ran.
+
+        rowcount comes from the fixture, so every other assertion here passes
+        with `cur.execute` deleted -- measured, the suite stayed at 206. A
+        preview that runs nothing and reports a number is worse than no
+        preview, because the number looks authoritative.
+        """
+        client.post("/triage/rerun?preview=1", json={"senders": ["*@example.com"]})
+        cur = conn.cursor.return_value.__enter__.return_value
+        assert cur.execute.called, "the preview must run the real statement"
+        sql, params = cur.execute.call_args[0]
+        assert "INSERT INTO queue" in sql
+        assert "ON CONFLICT DO NOTHING" in sql
+        assert params, "bound parameters must reach the statement"
+
+    @patch("gateway.blueprints.triage.postgres.execute_update")
+    def test_preview_never_takes_the_committing_path(self, mock_update, conn, client):
+        """execute_update is the path that writes for real; preview must not use it."""
+        client.post("/triage/rerun?preview=1", json={"senders": ["*@example.com"]})
+        assert not mock_update.called
+
     @patch("gateway.blueprints.triage.postgres.execute_update")
     def test_without_preview_it_really_enqueues(self, mock_update, client):
         mock_update.return_value = 412

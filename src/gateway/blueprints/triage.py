@@ -3,6 +3,7 @@
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from cortex_utils.logging import get_logger
 from flask import Blueprint, jsonify, request
 
 from gateway.auth import is_preview
@@ -10,6 +11,7 @@ from gateway.services import postgres
 from gateway.services.postgres import ConnectionContext
 
 triage_bp = Blueprint("triage", __name__)
+logger = get_logger()
 
 
 @triage_bp.route("/stats")
@@ -203,11 +205,12 @@ def rerun_triage():
     query += " ON CONFLICT DO NOTHING"
 
     # PREVIEW RUNS THE REAL STATEMENT AND ROLLS IT BACK, rather than
-    # rewriting it into a COUNT. The statement carries DISTINCT ON, a
-    # NOT EXISTS de-duplication and ON CONFLICT DO NOTHING; a hand-built
-    # count would have to restate all three and would drift from them on the
-    # next edit, reporting a number the real call does not produce. Executing
-    # and discarding is exact by construction.
+    # rewriting it into a COUNT. Which clauses are in play depends on the
+    # branch -- DISTINCT ON only for the senders and label filters, NOT EXISTS
+    # only when force is false, ON CONFLICT DO NOTHING always -- so a
+    # hand-built count would have to reproduce that branching and would drift
+    # from it on the next edit, reporting a number the real call does not
+    # produce. Executing and discarding is exact by construction.
     #
     # It consumes sequence values, which are not rolled back. Harmless: the
     # queue's id is a surrogate and gaps mean nothing.
@@ -217,6 +220,18 @@ def rerun_triage():
                 cur.execute(query, tuple(params))
                 count = cur.rowcount
             conn.rollback()
+        # An operator reading "would enqueue N" needs to know no rows landed;
+        # the real path below logs the same shape with preview=False.
+        logger.info(
+            "triage_rerun",
+            preview=True,
+            count=count,
+            label=label,
+            senders=senders or None,
+            gmail_ids=len(gmail_ids) or None,
+            force=force,
+            priority=priority,
+        )
         return jsonify(
             {
                 "preview": True,
@@ -232,6 +247,16 @@ def rerun_triage():
         )
 
     count = postgres.execute_update(query, tuple(params))
+    logger.info(
+        "triage_rerun",
+        preview=False,
+        count=count,
+        label=label,
+        senders=senders or None,
+        gmail_ids=len(gmail_ids) or None,
+        force=force,
+        priority=priority,
+    )
 
     return jsonify(
         {

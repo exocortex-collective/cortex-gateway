@@ -184,10 +184,9 @@ def _ui_route_allowed(method: str, path: str, args: Any) -> bool:
     the UI may ask. Without preview the same path enqueues thousands of rows
     at a chosen priority, so it stays with api_token.
 
-    #40 shipped this conditional WITHOUT the preview branch existing in
-    blueprints/triage.py, which made it a permission to do the exact bulk
-    write it reads as withholding. It is only sound because this PR adds that
-    branch; the two belong in one change.
+    This permission is only sound while blueprints/triage.py honours
+    ?preview=; the gate and the route share is_preview so they cannot
+    disagree about what one is.
     """
     if (method, path) in UI_ALLOWED_EXACT:
         return True
