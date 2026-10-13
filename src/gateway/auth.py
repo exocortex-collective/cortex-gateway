@@ -110,13 +110,19 @@ def _is_exempt(path: str) -> bool:
 # allowlist precisely so that a new endpoint is closed until someone decides
 # otherwise. See Config.ui_token for why the UI does not simply use api_token.
 #
+# Some entries name routes this service does not serve yet (/queue/dead,
+# /queue/stuck, /queue/health, /triage/questions*). Listing one early is inert
+# -- with no handler the request 404s for every caller -- whereas the reverse,
+# a route landing without being listed, 403s the UI and reads as a bug.
+#
 # Deliberately NOT here, and each for a reason: PUT/POST /config and
 # /config/rollback (one request rewrites every triage rule), PUT and DELETE
 # /mappings (a precedent should be added from the UI, not silently removed),
 # /sync/* and /backfill/* (they spend Gmail API quota), /oauth/* (credential
 # management, and /oauth/status returns a server filesystem path),
-# POST /queue/failed/retry-all and DELETE /queue/failed/<id> (bulk, unscoped
-# by id).
+# POST /queue/failed/retry-all (bulk) and DELETE /queue/failed/<id>
+# (destructive), and POST /triage/rerun (enqueues in bulk at a chosen
+# priority; the UI gets it back when a read-only preview mode exists).
 UI_ALLOWED_EXACT: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/health"),
@@ -150,25 +156,29 @@ UI_ALLOWED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def _ui_route_allowed(method: str, path: str, args: Any) -> bool:
-    """Whether the scoped UI token may call this method and path.
+def _token_matches(presented: str | None, expected: str) -> bool:
+    """Constant-time compare of a presented credential against a configured one.
 
-    POST /triage/rerun is the one conditional case: with ?preview=1 it counts
-    what it would enqueue and writes nothing, which is safe for the UI. The
-    same path without preview enqueues thousands of rows at a chosen
-    priority, so it stays with api_token.
+    Compare BYTES. hmac.compare_digest raises TypeError on a str with
+    non-ASCII characters, so a header of `X-Cortex-Token: café` escaped the
+    gate as an unhandled exception: Flask turned it into a 500, discarding
+    both the intended 401 body and the api_auth_rejected audit line, and
+    handing any external caller a one-request way to spray tracebacks into
+    the logs.
     """
+    if not presented or not expected:
+        return False
+    return hmac.compare_digest(
+        presented.encode("utf-8", "surrogatepass"),
+        expected.encode("utf-8", "surrogatepass"),
+    )
+
+
+def _ui_route_allowed(method: str, path: str) -> bool:
+    """Whether the scoped UI token may call this method and path."""
     if (method, path) in UI_ALLOWED_EXACT:
         return True
-    if method == "POST" and path == "/triage/rerun":
-        return _is_preview(args)
     return any(m == method and pat.match(path) for m, pat in UI_ALLOWED_PATTERNS)
-
-
-def _is_preview(args: Any) -> bool:
-    """A truthy ?preview= value. "0" and "false" do not count."""
-    raw = (args.get("preview") or "").strip().lower()
-    return raw in ("1", "true", "yes")
 
 
 def _parse_subnets(raw: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
@@ -225,6 +235,7 @@ def init_auth(
     token: str,
     trusted_subnets: str = "",
     internal_port: int | None = DEFAULT_INTERNAL_PORT,
+    *,
     ui_token: str = "",
     ui_origins: str = "",
 ) -> None:
@@ -262,9 +273,15 @@ def init_auth(
         )
 
     trusted = _parse_subnets(trusted_subnets)
-    # Same stripping argument as the api token above: a secret read from a
-    # file arrives with a trailing newline and would never match.
-    ui_token = ui_token.strip()
+    # Same two arguments as the api token above, including the second one: a
+    # whitespace-only value must not strip down to "unconfigured".
+    raw_ui_token, ui_token = ui_token, ui_token.strip()
+    if raw_ui_token and not ui_token:
+        raise ValueError(
+            "CORTEX_UI_TOKEN is set but contains only whitespace. This is "
+            "usually an empty or unpopulated secret file. Unset it to run "
+            "without scoped UI access, or give it a real value."
+        )
     origins = frozenset(o.strip() for o in ui_origins.split(",") if o.strip())
 
     if "*" in origins:
@@ -345,9 +362,7 @@ def init_auth(
         # route table. Only an allowlisted origin gets this far; anything
         # else falls through to the normal gate.
         if request.method == "OPTIONS" and _allowed_origin():
-            preflight = jsonify({})
-            preflight.status_code = 204
-            preflight.data = b""
+            preflight = Response(status=204)
             preflight.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
             preflight.headers["Access-Control-Allow-Headers"] = (
                 "Authorization, Content-Type, X-Created-By, X-Updated-By"
@@ -370,16 +385,7 @@ def init_auth(
             return None
 
         presented = _presented_token(request.headers)
-        # Compare BYTES. hmac.compare_digest raises TypeError on a str with
-        # non-ASCII characters, so a header of `X-Cortex-Token: café` escaped
-        # this function as an unhandled exception: Flask turned it into a 500,
-        # discarding both the intended 401 body and the api_auth_rejected
-        # audit line, and handing any external caller a one-request way to
-        # spray tracebacks into the logs.
-        if presented and hmac.compare_digest(
-            presented.encode("utf-8", "surrogatepass"),
-            token.encode("utf-8", "surrogatepass"),
-        ):
+        if _token_matches(presented, token):
             return None
 
         # The scoped UI token: authenticated, but only for UI_ALLOWED routes.
@@ -387,15 +393,8 @@ def init_auth(
         # permitted here" from "this token is wrong" -- the first is a bug in
         # the UI, the second is a misconfigured credential, and a single 401
         # for both sends the user to re-enter a token that was fine.
-        if (
-            ui_token
-            and presented
-            and hmac.compare_digest(
-                presented.encode("utf-8", "surrogatepass"),
-                ui_token.encode("utf-8", "surrogatepass"),
-            )
-        ):
-            if _ui_route_allowed(request.method, path, request.args):
+        if _token_matches(presented, ui_token):
+            if _ui_route_allowed(request.method, path):
                 return None
             logger.warning(
                 "ui_token_route_denied",

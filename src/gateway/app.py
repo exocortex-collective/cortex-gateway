@@ -54,8 +54,8 @@ def create_app() -> Flask:
         config.api_token,
         config.trusted_subnets,
         config.internal_port,
-        config.ui_token,
-        config.ui_origins,
+        ui_token=config.ui_token,
+        ui_origins=config.ui_origins,
     )
 
     # Apply metrics middleware

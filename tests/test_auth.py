@@ -587,6 +587,46 @@ def test_create_app_binds_the_gate_to_the_internal_port_not_the_external_one(
     ), "the same peer on the EXTERNAL port must be challenged"
 
 
+def test_create_app_wires_the_ui_token_and_origins_through(monkeypatch, reloaded_gateway) -> None:
+    """The real chain: env -> Config -> create_app -> init_auth.
+
+    Every other scoped-token test calls init_auth directly with literals, so
+    none of them sees this call site. Dropping both arguments here passed the
+    whole suite while leaving the feature dead in production: the extension
+    would 401 on every request and the startup log would say ui_token_set=False.
+    """
+    origin = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    monkeypatch.setenv("CORTEX_API_TOKEN", "s3cret")
+    monkeypatch.setenv("CORTEX_TRUSTED_SUBNETS", "172.26.0.0/16")
+    monkeypatch.setenv("CORTEX_UI_TOKEN", "ui-s3cret")
+    monkeypatch.setenv("CORTEX_UI_ORIGINS", origin)
+    monkeypatch.setenv("POSTGRES_PASSWORD", "x")
+    monkeypatch.setenv("OAUTH_SECRET_KEY", "x")
+    monkeypatch.setenv("OAUTH_TOKEN_PATH", "/tmp/t.json")
+
+    gateway_app = reloaded_gateway()
+    with (
+        patch("gateway.app.init_pool"),
+        patch("gateway.app.start_metrics_server"),
+    ):
+        app = gateway_app.create_app()
+
+    client = app.test_client()
+    external = "http://localhost:8098"
+    ui = {"Authorization": "Bearer ui-s3cret", "Origin": origin}
+
+    # An allowlisted route: the gate accepts, so routing answers (404 here,
+    # since this app's /queue/stats needs a database to be a 200).
+    assert client.get("/queue/stats", base_url=external, headers=ui).status_code != 401
+    # A route off the allowlist: authenticated, not permitted.
+    assert client.put("/config", base_url=external, headers=ui).status_code == 403
+    # And the origin reached the CORS layer.
+    assert (
+        client.get("/health", base_url=external, headers=ui).headers["Access-Control-Allow-Origin"]
+        == origin
+    )
+
+
 def test_config_internal_port_matches_a_port_the_dockerfile_binds(
     monkeypatch, reloaded_gateway
 ) -> None:
