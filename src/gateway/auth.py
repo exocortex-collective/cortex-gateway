@@ -349,9 +349,9 @@ def init_auth(
             preflight.status_code = 204
             preflight.data = b""
             preflight.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
-            preflight.headers[
-                "Access-Control-Allow-Headers"
-            ] = "Authorization, Content-Type, X-Created-By, X-Updated-By"
+            preflight.headers["Access-Control-Allow-Headers"] = (
+                "Authorization, Content-Type, X-Created-By, X-Updated-By"
+            )
             preflight.headers["Access-Control-Max-Age"] = "600"
             return preflight
 

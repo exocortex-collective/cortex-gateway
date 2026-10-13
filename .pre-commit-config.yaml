@@ -10,11 +10,16 @@ repos:
       - id: check-added-large-files
       - id: check-merge-conflict
 
-  - repo: https://github.com/psf/black
-    rev: 23.7.0
+  # Use the project's own black (pyproject: black>=24.0.0) rather than a
+  # pinned mirror -- a separate pin drifts from CI's `uv run black` and then
+  # silently reverts commits that CI demands.
+  - repo: local
     hooks:
       - id: black
-        language_version: python3
+        name: black
+        entry: uv run black
+        language: system
+        types: [python]
 
   - repo: https://github.com/pycqa/isort
     rev: 5.12.0
