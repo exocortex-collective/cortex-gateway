@@ -22,7 +22,9 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from flask import Flask, jsonify
+from flask import Flask, Response, jsonify
+from flask.testing import FlaskClient
+from werkzeug.test import TestResponse
 
 from gateway.auth import UI_ALLOWED_EXACT, UI_ALLOWED_PATTERNS, _ui_route_allowed, init_auth
 
@@ -32,21 +34,40 @@ ORIGIN = "chrome-extension://jkgpflheabfjgmikaagejgnmopiknooj"
 OTHER_ORIGIN = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 TRUSTED = "172.26.0.0/16"
 
+# Per UI_ALLOWED_PATTERNS entry: the method, a path it must match, the paths it
+# must NOT match, and a method it must not accept on that same path.
+# test_every_pattern_has_a_sample keeps this as long as the pattern tuple.
+#
+# The non-matching paths cover both ways a regex goes loose -- an extra
+# segment, and a character class widened -- and the wrong method is what
+# catches a match that ignores the method entirely.
+PATTERN_SAMPLES = (
+    (
+        "POST",
+        "/queue/failed/5/retry",
+        ("/queue/failed/5/retry/extra", "/queue/failed/abc/retry"),
+        "GET",
+    ),
+    (
+        "POST",
+        "/triage/questions/q-3f8a/answer",
+        ("/triage/questions/a/b/answer", "/triage/questions/q.3f8a/answer"),
+        "GET",
+    ),
+    ("GET", "/config/diff/5/6", ("/config/diff/5/6/7", "/config/diff/a/b"), "POST"),
+    ("GET", "/mappings/history/a@b.com", ("/mappings/history/",), "DELETE"),
+    ("GET", "/emails/by-label/Uncategorized", ("/emails/by-label/",), "POST"),
+    ("GET", "/emails/19ae00", ("/emails/19ae00/body",), "DELETE"),
+    (
+        "GET",
+        "/emails/19ae00/text",
+        ("/emails/19ae00/text/extra", "/emails/a/b/text"),
+        "POST",
+    ),
+)
+
 # Routes the app under test serves. The gate runs before dispatch, so the
 # handlers only need to exist for the allowed cases to come back 200.
-# One concrete path per UI_ALLOWED_PATTERNS entry, with a path that the
-# pattern must NOT match. test_every_pattern_has_a_sample asserts this list
-# stays as long as the pattern tuple, so adding a pattern without a sample
-# fails rather than going silently unasserted.
-PATTERN_SAMPLES = (
-    ("POST", "/queue/failed/5/retry", "/queue/failed/5/retry/extra"),
-    ("POST", "/triage/questions/q-3f8a/answer", "/triage/questions/a/b/answer"),
-    ("GET", "/config/diff/5/6", "/config/diff/5/6/7"),
-    ("GET", "/mappings/history/a@b.com", "/mappings/history/"),
-    ("GET", "/emails/by-label/Uncategorized", "/emails/by-label/"),
-    ("GET", "/emails/19ae00", "/emails/19ae00/body"),
-    ("GET", "/emails/19ae00/text", "/emails/19ae00/text/extra"),
-)
 
 # Routes the app under test serves. The gate runs before dispatch, so the
 # handlers only need to exist for the allowed cases to come back 200.
@@ -64,13 +85,13 @@ DENIED_ROUTES = (
 
 ROUTES = (
     *((path, (method,)) for method, path in sorted(UI_ALLOWED_EXACT)),
-    *((path, (method,)) for method, path, _ in PATTERN_SAMPLES),
+    *((path, (method,)) for method, path, _over, _wrong in PATTERN_SAMPLES),
     *DENIED_ROUTES,
 )
 
 
 @pytest.fixture
-def client() -> Any:
+def client() -> FlaskClient:
     """A real Flask app with the real gate installed.
 
     init_auth IS the thing under test, so it is wired for real rather than
@@ -95,7 +116,7 @@ def client() -> Any:
     return app.test_client()
 
 
-def _ui(client: Any, method: str, path: str, **kw: Any) -> Any:
+def _ui(client: FlaskClient, method: str, path: str, **kw: Any) -> TestResponse:
     return client.open(
         path,
         method=method,
@@ -120,12 +141,21 @@ class TestPreflight:
         header it was not allowed to send.
         """
         r = client.open("/queue/dead", method="OPTIONS", headers={"Origin": ORIGIN})
-        methods = r.headers["Access-Control-Allow-Methods"]
-        for method in ("GET", "POST", "DELETE", "OPTIONS"):
-            assert method in methods
-        headers = r.headers["Access-Control-Allow-Headers"]
-        for header in ("Authorization", "Content-Type", "X-Created-By", "X-Updated-By"):
-            assert header in headers
+        parse = lambda h: {v.strip() for v in r.headers[h].split(",")}  # noqa: E731
+        # Exact sets, not membership: checking only that GET is present let a
+        # widened list through, and PUT added to Allow-Methods survived.
+        assert parse("Access-Control-Allow-Methods") == {
+            "GET",
+            "POST",
+            "DELETE",
+            "OPTIONS",
+        }
+        assert parse("Access-Control-Allow-Headers") == {
+            "Authorization",
+            "Content-Type",
+            "X-Created-By",
+            "X-Updated-By",
+        }
         assert r.headers["Access-Control-Max-Age"] == "600"
 
     def test_preflight_for_an_unknown_path_looks_identical(self, client) -> None:
@@ -168,6 +198,32 @@ class TestCorsHeaders:
         r = client.open("/queue/dead", method="OPTIONS", headers={"Origin": ORIGIN})
         assert "Origin" in r.headers.get("Vary", "")
 
+    def test_vary_is_added_to_an_existing_one_not_written_over(self) -> None:
+        """headers.add, not assignment. Checking "Origin" in Vary misses this.
+
+        A handler that varies on something else of its own -- content
+        negotiation, compression -- loses that value if the CORS layer
+        assigns rather than appends, and the cache then serves one encoding
+        for all of them.
+        """
+        app = Flask(__name__)
+
+        @app.route("/varies")
+        def varies() -> Response:
+            resp = jsonify({"ok": True})
+            resp.headers["Vary"] = "Accept-Encoding"
+            return resp
+
+        init_auth(app, API_TOKEN, TRUSTED, 8080, ui_token=UI_TOKEN, ui_origins=ORIGIN)
+        # The api token, not the UI one: /varies is not on the allowlist, so a
+        # UI-token request is answered by the gate and never reaches the handler
+        # that sets the other Vary value.
+        r = app.test_client().get(
+            "/varies", headers={"Authorization": f"Bearer {API_TOKEN}", "Origin": ORIGIN}
+        )
+        values = {v.strip() for part in r.headers.getlist("Vary") for v in part.split(",")}
+        assert values == {"Accept-Encoding", "Origin"}
+
     def test_credentials_are_never_allowed(self, client) -> None:
         """/oauth/start sets a Flask session cookie; it must not be rideable."""
         r = _ui(client, "GET", "/queue/dead")
@@ -190,34 +246,87 @@ class TestTheUiTokenIsScoped:
         """
         assert _ui(client, method, path).status_code == 200
 
-    @pytest.mark.parametrize("method,path,_over", PATTERN_SAMPLES)
-    def test_every_pattern_entry_is_reachable(self, client, method, path, _over) -> None:
+    @pytest.mark.parametrize("method,path,_over,_wrong", PATTERN_SAMPLES)
+    def test_every_pattern_entry_is_reachable(self, client, method, path, _over, _wrong) -> None:
         assert _ui(client, method, path).status_code == 200
 
-    @pytest.mark.parametrize("method,_path,over", PATTERN_SAMPLES)
-    def test_no_pattern_over_matches(self, client, method, _path, over) -> None:
-        """403 is the gate denying; 404 would mean the pattern matched.
+    @pytest.mark.parametrize(
+        "method,over", [(m, o) for m, _p, overs, _w in PATTERN_SAMPLES for o in overs]
+    )
+    def test_no_pattern_over_matches(self, client, method, over) -> None:
+        """403 is the gate denying; anything else means the pattern matched.
 
-        The over-match paths are deliberately unregistered, so reaching
-        routing at all proves the regex was too loose.
+        The over-match paths are deliberately unregistered, so reaching routing
+        at all proves the regex was too loose.
         """
         assert _ui(client, method, over).status_code == 403
+
+    @pytest.mark.parametrize("wrong_method,path", [(w, p) for _m, p, _o, w in PATTERN_SAMPLES])
+    def test_a_pattern_does_not_accept_another_method(self, client, wrong_method, path) -> None:
+        """The method is half of each pattern entry and was unasserted.
+
+        Dropping `m == method` from the any() in _ui_route_allowed left the
+        whole file green, so every GET-only pattern silently took POST too.
+        """
+        assert _ui(client, wrong_method, path).status_code == 403
 
     def test_every_pattern_has_a_sample(self) -> None:
         """So a pattern added without a sample fails instead of going unasserted."""
         assert len(PATTERN_SAMPLES) == len(UI_ALLOWED_PATTERNS)
 
-    def test_the_allowlist_is_the_size_it_is_meant_to_be(self) -> None:
-        """Pins the COUNT, because the cases above are derived from the list.
+    def test_the_allowlist_is_exactly_this(self) -> None:
+        """A snapshot of the whole boundary, pinned by CONTENT.
 
-        Deriving them means an entry deleted from the allowlist deletes its own
-        test case: measured, removing ("GET", "/queue/stats") took the file from
-        65 passed to 64 passed with nothing red. Only a count notices. Changing
-        either number is the deliberate act of widening or narrowing what the
-        browser may reach, so it should take an edit here.
+        The cases above are derived from the allowlist, which means the
+        allowlist cannot check itself: an entry deleted from it deletes its own
+        test case, and an entry CHANGED in place just moves the case. Measured
+        on this file, control 66 passed:
+
+          delete ("GET", "/queue/stats")          -> 65 passed, nothing red
+          ("GET", "/queue/stats")  -> DELETE      -> 66 passed, nothing red
+          ("POST", "/mappings")    -> PUT         -> 66 passed, nothing red
+          ("GET", "/triage/stats") -> POST        -> 66 passed, nothing red
+
+        A count caught the first and none of the others, and the second row is
+        a method the comment on UI_ALLOWED_EXACT explicitly withholds. So the
+        snapshot is the assertion: widening, narrowing or re-pointing what the
+        browser may reach has to be an edit here, in a diff a reviewer reads.
         """
-        assert len(UI_ALLOWED_EXACT) == 15
-        assert len(UI_ALLOWED_PATTERNS) == 7
+        assert UI_ALLOWED_EXACT == frozenset(
+            {
+                ("GET", "/health"),
+                ("GET", "/queue/health"),
+                ("GET", "/queue/stats"),
+                ("GET", "/queue/failed"),
+                ("GET", "/queue/dead"),
+                ("GET", "/queue/stuck"),
+                ("POST", "/queue/dead/resubmit"),
+                ("POST", "/queue/dead/dismiss"),
+                ("GET", "/triage/questions"),
+                ("GET", "/triage/stats"),
+                ("GET", "/triage/classifications"),
+                ("GET", "/triage/convergence/status"),
+                ("GET", "/config/versions"),
+                ("GET", "/mappings"),
+                ("POST", "/mappings"),
+            }
+        )
+
+    def test_the_allowlist_patterns_are_exactly_these(self) -> None:
+        """Snapshot of the regex half, for the same reason, source text and all.
+
+        Pinning the pattern SOURCE is the point: loosening \\d+ to .+ leaves
+        every derived case passing, because the sample still matches.
+        """
+        assert tuple((m, pat.pattern) for m, pat in UI_ALLOWED_PATTERNS) == (
+            ("POST", r"^/queue/failed/\d+/retry$"),
+            ("POST", r"^/triage/questions/[A-Za-z0-9_-]+/answer$"),
+            ("GET", r"^/config/diff/\d+/\d+$"),
+            ("GET", r"^/mappings/history/.+$"),
+            ("GET", r"^/emails/by-label/.+$"),
+            ("GET", r"^/emails/[^/]+$"),
+            ("GET", r"^/emails/[^/]+/text$"),
+        )
 
     @pytest.mark.parametrize(
         "method,path,why",
@@ -294,7 +403,14 @@ class TestTokenAndOriginParsing:
         with pytest.raises(ValueError, match="only whitespace"):
             init_auth(app, API_TOKEN, TRUSTED, 8080, ui_token="\n ", ui_origins=ORIGIN)
 
-    def test_origins_are_stripped_and_empty_chunks_dropped(self) -> None:
+    def test_several_origins_are_parsed_and_only_those_are_allowed(self) -> None:
+        """Stripping, multiple origins, and nothing else getting in.
+
+        The previous version of this asserted that empty chunks are "dropped",
+        which no request can show: a dropped chunk and a chunk that was never
+        there look the same from outside. What is checkable is that both real
+        origins work and a third does not.
+        """
         app = Flask(__name__)
         app.add_url_rule("/queue/dead", view_func=lambda: jsonify({"ok": True}))
         init_auth(
@@ -312,6 +428,14 @@ class TestTokenAndOriginParsing:
                 headers={"Authorization": f"Bearer {UI_TOKEN}", "Origin": origin},
             )
             assert r.headers["Access-Control-Allow-Origin"] == origin
+        third = client.get(
+            "/queue/dead",
+            headers={
+                "Authorization": f"Bearer {UI_TOKEN}",
+                "Origin": "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            },
+        )
+        assert "Access-Control-Allow-Origin" not in third.headers
 
     def test_a_wildcard_among_other_origins_is_still_refused(self) -> None:
         """The guard is `"*" in origins`, not `origins == {"*"}`.

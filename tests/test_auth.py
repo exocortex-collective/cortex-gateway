@@ -615,10 +615,11 @@ def test_create_app_wires_the_ui_token_and_origins_through(monkeypatch, reloaded
     external = "http://localhost:8098"
     ui = {"Authorization": "Bearer ui-s3cret", "Origin": origin}
 
-    # An allowlisted route: the gate accepts, so routing answers (404 here,
-    # since this app's /queue/stats needs a database to be a 200).
-    assert client.get("/queue/stats", base_url=external, headers=ui).status_code != 401
-    # A route off the allowlist: authenticated, not permitted.
+    # A route off the allowlist: 403, not 401, is what proves the UI token was
+    # wired in -- an unconfigured one makes this request 401. Deliberately not
+    # asserting on an allowlisted route here: every one this app serves calls
+    # Postgres, so the request opened a real socket and the only honest
+    # assertion left was "not 401", which a 500 also satisfies.
     assert client.put("/config", base_url=external, headers=ui).status_code == 403
     # And the origin reached the CORS layer.
     assert (

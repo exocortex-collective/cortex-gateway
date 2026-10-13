@@ -110,10 +110,12 @@ def _is_exempt(path: str) -> bool:
 # allowlist precisely so that a new endpoint is closed until someone decides
 # otherwise. See Config.ui_token for why the UI does not simply use api_token.
 #
-# Some entries name routes this service does not serve yet (/queue/dead,
-# /queue/stuck, /queue/health, /triage/questions*). Listing one early is inert
-# -- with no handler the request 404s for every caller -- whereas the reverse,
-# a route landing without being listed, 403s the UI and reads as a bug.
+# Six entries name routes this service does not serve yet, measured against
+# create_app's url_map: GET /queue/dead, /queue/health, /queue/stuck,
+# /triage/questions, and POST /queue/dead/resubmit, /queue/dead/dismiss.
+# Listing one early is inert -- the UI token reaches routing and gets a 404 --
+# whereas the reverse, a route landing without being listed, 403s the UI and
+# reads as a bug.
 #
 # Deliberately NOT here, and each for a reason: PUT/POST /config and
 # /config/rollback (one request rewrites every triage rule), PUT and DELETE
