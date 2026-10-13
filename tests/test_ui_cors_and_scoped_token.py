@@ -143,11 +143,17 @@ class TestPreflight:
         parse = lambda h: {v.strip() for v in r.headers[h].split(",")}  # noqa: E731
         # Exact sets, not membership: checking only that GET is present let a
         # widened list through, and PUT added to Allow-Methods survived.
-        assert parse("Access-Control-Allow-Methods") == {"GET", "POST", "OPTIONS"}
+        assert parse("Access-Control-Allow-Methods") == {
+            "GET",
+            "POST",
+            "DELETE",
+            "OPTIONS",
+        }
         assert parse("Access-Control-Allow-Headers") == {
             "Authorization",
             "Content-Type",
             "X-Created-By",
+            "X-Updated-By",
         }
         assert r.headers["Access-Control-Max-Age"] == "600"
 
@@ -289,15 +295,27 @@ class TestTheUiTokenIsScoped:
         """
         assert _ui(client, "GET", path).status_code == 403
 
-    def test_the_preflight_advertises_nothing_the_allowlist_withholds(self) -> None:
-        """A preflight that promises DELETE promises a 403.
+    def test_a_withheld_method_is_advertised_so_its_403_is_reachable(
+        self, client: FlaskClient
+    ) -> None:
+        """The preflight must advertise MORE than the allowlist permits.
 
-        Allow-Methods and Allow-Headers are hand-written while the allowlist
-        is data, so they drift apart silently: the browser is told it may send
-        a method no allowed route accepts.
+        No allowed route accepts DELETE, so it would be tempting to drop it
+        from Allow-Methods. That would make the browser block the request and
+        hand the extension an opaque failed fetch, replacing the 403 whose
+        whole purpose is telling "not permitted here" from "wrong credential".
+        The gate, not the preflight, is the boundary.
         """
-        used = {m for m, _ in UI_ALLOWED_EXACT} | {m for m, _ in UI_ALLOWED_PATTERNS}
-        assert used == {"GET", "POST"}
+        advertised = {
+            v.strip()
+            for v in client.open("/queue/dead", method="OPTIONS", headers={"Origin": ORIGIN})
+            .headers["Access-Control-Allow-Methods"]
+            .split(",")
+        }
+        denied = _ui(client, "DELETE", "/queue/failed/5")
+        assert denied.status_code == 403
+        assert denied.get_json()["error"] == "token not permitted for this route"
+        assert "DELETE" in advertised, "or the browser masks that 403"
 
     def test_every_pattern_has_a_sample(self) -> None:
         """So a pattern added without a sample fails instead of going unasserted."""

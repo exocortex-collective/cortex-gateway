@@ -365,13 +365,17 @@ def init_auth(
         # else falls through to the normal gate.
         if request.method == "OPTIONS" and _allowed_origin():
             preflight = Response(status=204)
-            # Only what a UI_ALLOWED route actually uses. Every allowed entry
-            # is a GET or a POST, and X-Updated-By is read only by the mapping
-            # PUT and DELETE, which the allowlist withholds -- advertising
-            # either would promise the browser a capability the token is 403 on.
-            preflight.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            # DELETE and X-Updated-By are advertised although NO UI_ALLOWED
+            # route accepts them, and that is deliberate. A preflight grants
+            # nothing -- the gate decides, and a withheld route is 403 either
+            # way -- so narrowing this buys no security. What it costs is the
+            # legibility the 403 exists for: a method the preflight omits is
+            # blocked by the BROWSER, and the extension sees an opaque failed
+            # fetch with no status instead of "token not permitted for this
+            # route". Narrowed for one round and reverted; see PR #40.
+            preflight.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
             preflight.headers["Access-Control-Allow-Headers"] = (
-                "Authorization, Content-Type, X-Created-By"
+                "Authorization, Content-Type, X-Created-By, X-Updated-By"
             )
             preflight.headers["Access-Control-Max-Age"] = "600"
             return preflight
