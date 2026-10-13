@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import hmac
 import ipaddress
+import re
 from typing import Any
 
 from cortex_utils.logging import get_logger
@@ -104,6 +105,84 @@ def _is_exempt(path: str) -> bool:
     return any(path == e or path.startswith(e + "/") for e in EXEMPT_PATHS)
 
 
+# ROUTES THE SCOPED UI TOKEN MAY REACH. Everything absent from this list is
+# 403 for that token, including every route added in future -- the list is an
+# allowlist precisely so that a new endpoint is closed until someone decides
+# otherwise. See Config.ui_token for why the UI does not simply use api_token.
+#
+# Six entries name routes this service does not serve yet, measured against
+# create_app's url_map: GET /queue/dead, /queue/health, /queue/stuck,
+# /triage/questions, and POST /queue/dead/resubmit, /queue/dead/dismiss.
+# Listing one early is inert -- the UI token reaches routing and gets a 404 --
+# whereas the reverse, a route landing without being listed, 403s the UI and
+# reads as a bug.
+#
+# Deliberately NOT here, and each for a reason: PUT/POST /config and
+# /config/rollback (one request rewrites every triage rule), PUT and DELETE
+# /mappings (a precedent should be added from the UI, not silently removed),
+# /sync/* and /backfill/* (they spend Gmail API quota), /oauth/* (credential
+# management, and /oauth/status returns a server filesystem path),
+# POST /queue/failed/retry-all (bulk) and DELETE /queue/failed/<id>
+# (destructive), and POST /triage/rerun (enqueues in bulk at a chosen
+# priority; the UI gets it back when a read-only preview mode exists).
+UI_ALLOWED_EXACT: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("GET", "/health"),
+        ("GET", "/queue/health"),
+        ("GET", "/queue/stats"),
+        ("GET", "/queue/failed"),
+        ("GET", "/queue/dead"),
+        ("GET", "/queue/stuck"),
+        ("POST", "/queue/dead/resubmit"),
+        ("POST", "/queue/dead/dismiss"),
+        ("GET", "/triage/questions"),
+        ("GET", "/triage/stats"),
+        ("GET", "/triage/classifications"),
+        ("GET", "/triage/convergence/status"),
+        ("GET", "/config/versions"),
+        ("GET", "/mappings"),
+        # The question-answer path writes a mapping, so the UI needs POST.
+        # PUT and DELETE stay out: answering a question adds a precedent.
+        ("POST", "/mappings"),
+    }
+)
+
+UI_ALLOWED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("POST", re.compile(r"^/queue/failed/\d+/retry$")),
+    ("POST", re.compile(r"^/triage/questions/[A-Za-z0-9_-]+/answer$")),
+    ("GET", re.compile(r"^/config/diff/\d+/\d+$")),
+    ("GET", re.compile(r"^/mappings/history/.+$")),
+    ("GET", re.compile(r"^/emails/by-label/.+$")),
+    ("GET", re.compile(r"^/emails/[^/]+$")),
+    ("GET", re.compile(r"^/emails/[^/]+/text$")),
+)
+
+
+def _token_matches(presented: str | None, expected: str) -> bool:
+    """Constant-time compare of a presented credential against a configured one.
+
+    Compare BYTES. hmac.compare_digest raises TypeError on a str with
+    non-ASCII characters, so a header of `X-Cortex-Token: café` escaped the
+    gate as an unhandled exception: Flask turned it into a 500, discarding
+    both the intended 401 body and the api_auth_rejected audit line, and
+    handing any external caller a one-request way to spray tracebacks into
+    the logs.
+    """
+    if not presented or not expected:
+        return False
+    return hmac.compare_digest(
+        presented.encode("utf-8", "surrogatepass"),
+        expected.encode("utf-8", "surrogatepass"),
+    )
+
+
+def _ui_route_allowed(method: str, path: str) -> bool:
+    """Whether the scoped UI token may call this method and path."""
+    if (method, path) in UI_ALLOWED_EXACT:
+        return True
+    return any(m == method and pat.match(path) for m, pat in UI_ALLOWED_PATTERNS)
+
+
 def _parse_subnets(raw: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
     nets = []
     for chunk in raw.split(","):
@@ -158,6 +237,9 @@ def init_auth(
     token: str,
     trusted_subnets: str = "",
     internal_port: int | None = DEFAULT_INTERNAL_PORT,
+    *,
+    ui_token: str = "",
+    ui_origins: str = "",
 ) -> None:
     """Install the before_request gate.
 
@@ -193,6 +275,31 @@ def init_auth(
         )
 
     trusted = _parse_subnets(trusted_subnets)
+    # Same two arguments as the api token above, including the second one: a
+    # whitespace-only value must not strip down to "unconfigured".
+    raw_ui_token, ui_token = ui_token, ui_token.strip()
+    if raw_ui_token and not ui_token:
+        raise ValueError(
+            "CORTEX_UI_TOKEN is set but contains only whitespace. This is "
+            "usually an empty or unpopulated secret file. Unset it to run "
+            "without scoped UI access, or give it a real value."
+        )
+    origins = frozenset(o.strip() for o in ui_origins.split(",") if o.strip())
+
+    if "*" in origins:
+        raise ValueError(
+            "CORTEX_UI_ORIGINS must list exact origins, never '*'. A wildcard "
+            "would let any page in the browser read the API with a token the "
+            "user has already stored for the extension."
+        )
+    if ui_token and not origins:
+        logger.warning(
+            "ui_token_without_origins",
+            message=(
+                "CORTEX_UI_TOKEN is set but CORTEX_UI_ORIGINS is empty, so no "
+                "browser origin can use it. Set the extension origin."
+            ),
+        )
 
     if token and not trusted:
         raise ValueError(
@@ -217,10 +324,62 @@ def init_auth(
             trusted_subnets=[str(n) for n in trusted],
             internal_port=internal_port,
             exempt=list(EXEMPT_PATHS),
+            ui_token_set=bool(ui_token),
+            ui_origins=sorted(origins),
         )
+
+    def _allowed_origin() -> str | None:
+        """The request's Origin, if we allow it. None otherwise."""
+        origin = request.headers.get("Origin")
+        return origin if origin and origin in origins else None
+
+    @app.after_request
+    def _cors(response: Response) -> Response:
+        """Attach CORS headers for an allowlisted origin.
+
+        `Vary: Origin` goes on EVERY response, allowlisted or not. Without it
+        a cache that saw an allowlisted request could hand the same response,
+        carrying Allow-Origin for that extension, to a different origin.
+
+        Access-Control-Allow-Credentials is deliberately never sent. The UI
+        authenticates with a bearer token, and /oauth/start puts a Flask
+        SESSION COOKIE on this origin -- allowing credentials would make that
+        cookie rideable from a page.
+        """
+        response.headers.add("Vary", "Origin")
+        allowed = _allowed_origin()
+        if allowed:
+            response.headers["Access-Control-Allow-Origin"] = allowed
+        return response
 
     @app.before_request
     def _require_token() -> Response | tuple[Response, int] | None:
+        # PREFLIGHT FIRST, BEFORE ANY CREDENTIAL CHECK. A CORS preflight is
+        # sent by the browser with no Authorization header -- it cannot carry
+        # one -- and _is_exempt matches on PATH only, so without this branch
+        # every preflight 401s and the extension cannot make a single call.
+        #
+        # It answers 204 with headers and no body, and answers identically
+        # for a path that does not exist, so it discloses nothing about the
+        # route table. Only an allowlisted origin gets this far; anything
+        # else falls through to the normal gate.
+        if request.method == "OPTIONS" and _allowed_origin():
+            preflight = Response(status=204)
+            # DELETE and X-Updated-By are advertised although NO UI_ALLOWED
+            # route accepts them, and that is deliberate. A preflight grants
+            # nothing -- the gate decides, and a withheld route is 403 either
+            # way -- so narrowing this buys no security. What it costs is the
+            # legibility the 403 exists for: a method the preflight omits is
+            # blocked by the BROWSER, and the extension sees an opaque failed
+            # fetch with no status instead of "token not permitted for this
+            # route". Narrowed for one round and reverted; see PR #40.
+            preflight.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+            preflight.headers["Access-Control-Allow-Headers"] = (
+                "Authorization, Content-Type, X-Created-By, X-Updated-By"
+            )
+            preflight.headers["Access-Control-Max-Age"] = "600"
+            return preflight
+
         if not token:
             return None
         path = request.path or "/"
@@ -236,17 +395,32 @@ def init_auth(
             return None
 
         presented = _presented_token(request.headers)
-        # Compare BYTES. hmac.compare_digest raises TypeError on a str with
-        # non-ASCII characters, so a header of `X-Cortex-Token: café` escaped
-        # this function as an unhandled exception: Flask turned it into a 500,
-        # discarding both the intended 401 body and the api_auth_rejected
-        # audit line, and handing any external caller a one-request way to
-        # spray tracebacks into the logs.
-        if presented and hmac.compare_digest(
-            presented.encode("utf-8", "surrogatepass"),
-            token.encode("utf-8", "surrogatepass"),
-        ):
+        if _token_matches(presented, token):
             return None
+
+        # The scoped UI token: authenticated, but only for UI_ALLOWED routes.
+        # 403 rather than 401 so the extension can tell "this token is not
+        # permitted here" from "this token is wrong" -- the first is a bug in
+        # the UI, the second is a misconfigured credential, and a single 401
+        # for both sends the user to re-enter a token that was fine.
+        if _token_matches(presented, ui_token):
+            if _ui_route_allowed(request.method, path):
+                return None
+            logger.warning(
+                "ui_token_route_denied",
+                remote_addr=request.remote_addr,
+                path=path,
+                method=request.method,
+            )
+            return (
+                jsonify(
+                    {
+                        "error": "token not permitted for this route",
+                        "path": path,
+                    }
+                ),
+                403,
+            )
 
         # Log the attempt, never the token. remote_addr is attacker-influenced,
         # so keep it a structured field rather than interpolating it.
