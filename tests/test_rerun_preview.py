@@ -14,7 +14,7 @@ query string.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -54,12 +54,12 @@ class TestPreview:
     def test_preview_executes_the_same_statement_the_real_path_would(self, conn, client):
         """The count is exact only if the preview runs the REAL statement.
 
-        Substring checks are not enough: a dummy execute carrying the same
-        two substrings, a reversed parameter tuple, a truncated one, and a
-        second execute call all passed an earlier version of this test. So
-        the statement and its parameters are compared against what the
-        non-preview path builds for the same request, which is the only
-        definition of "the real statement" that means anything.
+        Substring checks are not enough on their own -- a dummy statement
+        carrying the same two substrings, reversed parameters, a truncated
+        tuple and a doubled execute all satisfy them. So the statement and
+        its parameters are compared against what the non-preview path builds
+        for the same request, and against literal expected parameters, since
+        parity alone cannot catch a defect in the shared builder.
         """
         body = {"senders": ["*@example.com"], "days": 3, "priority": -50}
         # The senders branch derives a cutoff from now(), so the two requests
@@ -79,19 +79,54 @@ class TestPreview:
 
         assert preview_sql == real_sql
         assert preview_params == real_params
-        assert isinstance(preview_params, tuple) and preview_params
+
+        # Parity alone cannot catch a defect in the shared builder: both sides
+        # come from it, so timedelta(days + 1) or a mangled label param passes
+        # an equality check. The expected params are therefore spelled out.
+        assert preview_params == (
+            -50,
+            (frozen - timedelta(days=3)).isoformat(),
+            "%@example.com",
+        ), "priority, the days cutoff, and the sender glob as a LIKE pattern"
+        assert "FROM emails_raw er" in preview_sql
+        assert "JOIN emails_parsed ep" in preview_sql
+        assert "DISTINCT ON (er.gmail_id)" in preview_sql
+        assert "NOT EXISTS" in preview_sql, "force is false, so the dedup applies"
+
+    def test_a_sender_is_escaped_before_it_becomes_a_like_pattern(self, conn, client):
+        """Only `*` is a wildcard; LIKE's own metacharacters are escaped.
+
+        Unescaped, `a_b@example.com` matches `aXb@example.com` and a `%`
+        anywhere matches everything after it, so a rerun aimed at one sender
+        would re-triage mail from others. No other test here uses a sender
+        containing % or _, so none of them exercises the escaping.
+        """
+        client.post(
+            "/triage/rerun?preview=1",
+            json={"senders": ["a_b%c@example.com", "*@spam.example"]},
+        )
+        cur = conn.cursor.return_value.__enter__.return_value
+        params = cur.execute.call_args[0][1]
+        assert params[-2:] == (r"a\_b\%c@example.com", "%@spam.example")
 
     @patch("gateway.blueprints.triage.logger")
     def test_preview_is_distinguishable_from_a_real_enqueue_in_the_log(self, log, conn, client):
-        """An operator reading a count needs to know whether rows landed.
-
-        Deleting either log line passed before this.
-        """
+        """An operator reading a count needs to know whether rows landed."""
         client.post("/triage/rerun?preview=1", json={"senders": ["*@example.com"]})
         events = [c for c in log.info.call_args_list if c.args[0] == "triage_rerun"]
         assert len(events) == 1
-        assert events[0].kwargs["preview"] is True
-        assert events[0].kwargs["count"] == 412
+        # Every field, not just preview and count: an operator reading this
+        # line is reconstructing which mail a rerun would touch, so a wrong
+        # priority or an inverted force is a wrong answer.
+        assert events[0].kwargs == {
+            "preview": True,
+            "count": 412,
+            "label": None,
+            "senders": ["*@example.com"],
+            "gmail_ids": None,
+            "force": False,
+            "priority": -100,
+        }
 
     @patch("gateway.blueprints.triage.logger")
     @patch("gateway.blueprints.triage.postgres.execute_update")
@@ -100,8 +135,15 @@ class TestPreview:
         client.post("/triage/rerun", json={"senders": ["*@example.com"]})
         events = [c for c in log.info.call_args_list if c.args[0] == "triage_rerun"]
         assert len(events) == 1
-        assert events[0].kwargs["preview"] is False
-        assert events[0].kwargs["count"] == 9
+        assert events[0].kwargs == {
+            "preview": False,
+            "count": 9,
+            "label": None,
+            "senders": ["*@example.com"],
+            "gmail_ids": None,
+            "force": False,
+            "priority": -100,
+        }
 
     @patch("gateway.blueprints.triage.postgres.execute_update")
     def test_preview_never_takes_the_committing_path(self, mock_update, conn, client):

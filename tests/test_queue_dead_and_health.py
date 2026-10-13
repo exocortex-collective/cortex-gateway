@@ -221,11 +221,10 @@ class TestResponseShapes:
     def test_each_dead_field_is_wired_to_its_own_source(self, mgr, conn, client):
         """Keys alone do not pin the wiring.
 
-        The fixture gave created_at and failed_at the same value and both
-        dismissed_at and retried_at None, so swapping either pair passed. A
-        distinct value per field is what makes a swap visible -- and these are
-        timestamps the UI shows, so a swap is a wrong answer, not a cosmetic
-        one.
+        A distinct value per field is what makes a swap visible: the shared
+        fixture gives created_at and failed_at the same value and leaves both
+        dismissed_at and retried_at None, so a swap there is undetectable.
+        These are timestamps the UI shows, so a swap is a wrong answer.
         """
         row = _dead_row(
             created_at=datetime(2026, 1, 1, tzinfo=UTC),
@@ -244,9 +243,8 @@ class TestResponseShapes:
         assert d["ref"] == "19ae00"
         assert d["attempts"] == 7
         assert d["error"] == row["last_error"]
-        # flask.jsonify emits RFC-822, not ISO, with no custom provider --
-        # the UI contract calls this out, so the assertion matches the wire
-        # format the extension actually parses.
+        # flask.jsonify emits RFC-822, not ISO, with no custom provider
+        # configured, so this is the wire format the extension parses.
         assert "01 Jan 2026" in d["created_at"]
         assert "02 Feb 2026" in d["failed_at"]
         assert "03 Mar 2026" in d["dismissed_at"]
@@ -255,7 +253,7 @@ class TestResponseShapes:
 
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_count_is_the_rows_returned_and_limit_is_the_limit(self, mgr, conn, client):
-        """count wired to limit, and a changed default, both passed before."""
+        """count is len(rows); limit is the clamped page size. Not each other."""
         mgr.return_value.list_jobs.return_value = [_dead_row(1), _dead_row(2)]
         body = client.get("/queue/dead").get_json()
         assert body["count"] == 2
@@ -362,11 +360,34 @@ class TestBulkActions:
 
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_a_committed_retry_is_never_reported_as_a_failure(self, mgr, log, conn, client):
+        """retry_job commits, so the id has moved whatever happens next.
+
+        Reading back the new queue id is a convenience. Letting it decide `ok`
+        reports a durable re-enqueue as failed, drops it from the audit line's
+        `moved`, and invites the operator to retry an id that has already
+        gone -- which why_not_retryable then refuses, so the UI shows a
+        failure for work that succeeded.
+        """
+        m = mgr.return_value
+        m.retry_job.return_value = True
+        m.get_job.side_effect = RuntimeError("readback blew up")
+
+        data = client.post("/queue/dead/resubmit", json={"ids": [7]}).get_json()
+        assert data["results"] == [{"id": 7, "ok": True, "new_id": None}]
+        assert data["resubmitted"] == 1
+        assert {c.args[0] for c in log.warning.call_args_list} == {"queue_resubmit_readback_failed"}
+        audit = next(c for c in log.info.call_args_list if c.args[0] == "queue_bulk_action")
+        assert audit.kwargs["moved"] == [7], "the audit line must show it moved"
+
+    @patch("gateway.blueprints.queue.logger")
+    @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_the_bulk_action_is_audited(self, mgr, log, conn, client):
         """The audit line is the justification for the whole helper.
 
-        Deleting it, or including failed ids in `moved`, or blanking
-        remote_addr, all passed before this.
+        So its fields are asserted exactly: `moved` holding a failed id, or
+        remote_addr carrying something else about the request, are both
+        plausible edits that leave the line looking right.
         """
         m = mgr.return_value
         m.retry_job.side_effect = [True, False]
@@ -381,7 +402,9 @@ class TestBulkActions:
         assert fields["requested"] == [7, 8]
         assert fields["moved"] == [7], "only the ids that actually moved"
         assert fields["failed"] == [8]
-        assert fields["remote_addr"]
+        # The exact value: truthiness passed with request.host substituted,
+        # which is a different fact about the request entirely.
+        assert fields["remote_addr"] == "127.0.0.1"
 
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")
@@ -390,25 +413,42 @@ class TestBulkActions:
         mgr.return_value.retry_job.side_effect = RuntimeError("DETAIL: Key (x)=(secret)")
         client.post("/queue/dead/resubmit", json={"ids": [7]})
         warnings = {c.args[0]: c.kwargs for c in log.warning.call_args_list}
-        assert warnings["queue_bulk_item_failed"]["error_type"] == "RuntimeError"
+        assert warnings["queue_bulk_item_failed"] == {
+            "action": "resubmit",
+            "dead_id": 7,
+            "error_type": "RuntimeError",
+        }
         assert not any("secret" in str(v) for v in warnings["queue_bulk_item_failed"].values())
 
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_a_failing_rollback_still_returns_the_connection(self, mgr, log, conn, client):
-        """Unguarded, this leaked a pool slot and skipped the audit line.
+        """A rollback that raises must not take the request with it.
 
-        The rollback raising escaped _bulk, and ConnectionContext.__exit__
-        then rolled back again, raised again, and never reached
-        put_connection -- while ids had already been applied.
+        Unguarded it escapes _bulk, and ConnectionContext.__exit__ rolls back
+        again, raises again, and never reaches put_connection -- leaking the
+        pool slot and skipping the audit line while ids have been applied.
+        Note this app mocks ConnectionContext, so the assertions below cover
+        the response and the log lines; the pool itself is gateway-fcc1.
         """
         mgr.return_value.retry_job.side_effect = RuntimeError("boom")
         conn.rollback.side_effect = RuntimeError("connection already closed")
 
-        r = client.post("/queue/dead/resubmit", json={"ids": [7]})
+        r = client.post("/queue/dead/resubmit", json={"ids": [7, 8, 9]})
         assert r.status_code == 200
-        assert r.get_json()["results"][0]["ok"] is False
-        assert "queue_bulk_rollback_failed" in {c.args[0] for c in log.warning.call_args_list}
+        results = r.get_json()["results"]
+        # Every requested id, not just the first: with one id a break that
+        # dropped the rest was invisible.
+        assert [x["id"] for x in results] == [7, 8, 9]
+        assert all(x["ok"] is False for x in results)
+        rollbacks = [
+            c.kwargs
+            for c in log.warning.call_args_list
+            if c.args[0] == "queue_bulk_rollback_failed"
+        ]
+        assert rollbacks == [
+            {"action": "resubmit", "dead_id": i, "error_type": "RuntimeError"} for i in (7, 8, 9)
+        ]
         assert "queue_bulk_action" in {c.args[0] for c in log.info.call_args_list}
 
     @patch("gateway.blueprints.queue.DeadLetterManager")
@@ -434,11 +474,9 @@ class TestBulkActions:
     def test_the_gateway_does_not_commit_because_the_manager_does(self, mgr, conn, client):
         """DeadLetterManager.retry_job and .dismiss each commit for themselves.
 
-        An earlier version of this test asserted the gateway committed, which
-        pinned a redundant call: cortex_utils commits inside retry_job
-        (dead_letter.py) and dismiss, so a commit here was a second one on an
-        already-committed transaction. Asserting the absence keeps someone
-        from re-adding it on the strength of the old docstring.
+        cortex_utils commits inside retry_job (dead_letter.py:427) and dismiss
+        (:479), so a commit here would be a second one on an already-committed
+        transaction. Asserting its absence is what stops one being added back.
         """
         mgr.return_value.retry_job.return_value = True
         mgr.return_value.get_job.return_value = {"retried_as": 1}

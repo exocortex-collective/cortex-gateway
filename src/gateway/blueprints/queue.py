@@ -247,7 +247,20 @@ def resubmit_dead() -> Response | tuple[Response, int]:
     def _one(manager: DeadLetterManager, dead_id: int) -> dict[str, Any]:
         if not manager.retry_job(dead_id):
             return {"id": dead_id, "ok": False, "why": manager.why_not_retryable(dead_id)}
-        job = manager.get_job(dead_id)
+        # retry_job has COMMITTED by this point, so the id has moved whatever
+        # happens next. Reading back the new queue id is a convenience for the
+        # UI; letting it decide `ok` would report a durable re-enqueue as a
+        # failure, leave it out of the audit line's `moved`, and invite the
+        # operator to retry an id that had already gone.
+        try:
+            job = manager.get_job(dead_id)
+        except Exception as exc:
+            logger.warning(
+                "queue_resubmit_readback_failed",
+                dead_id=dead_id,
+                error_type=type(exc).__name__,
+            )
+            job = None
         return {"id": dead_id, "ok": True, "new_id": job["retried_as"] if job else None}
 
     results = _bulk(ids, _one, "resubmit")
