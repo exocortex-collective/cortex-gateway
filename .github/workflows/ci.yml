@@ -7,8 +7,8 @@ on:
     branches: [main]
 
 env:
-  REGISTRY: us-central1-docker.pkg.dev
-  IMAGE_NAME: cortex-gmail/cortex/gateway
+  REGISTRY: ghcr.io
+  IMAGE_NAME: exocortex-collective/gateway
 
 jobs:
   lint:
@@ -57,22 +57,20 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
-      id-token: write
+      packages: write
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          workload_identity_provider: projects/63779650346/locations/global/workloadIdentityPools/github-actions/providers/github-provider
-          service_account: github-actions@cortex-gmail.iam.gserviceaccount.com
-
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Docker image
-        run: docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest .
+        run: docker build --label org.opencontainers.image.source=https://github.com/${{ github.repository }} -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest .
 
       - name: Push Docker image
         run: |
