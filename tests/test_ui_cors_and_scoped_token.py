@@ -143,17 +143,11 @@ class TestPreflight:
         parse = lambda h: {v.strip() for v in r.headers[h].split(",")}  # noqa: E731
         # Exact sets, not membership: checking only that GET is present let a
         # widened list through, and PUT added to Allow-Methods survived.
-        assert parse("Access-Control-Allow-Methods") == {
-            "GET",
-            "POST",
-            "DELETE",
-            "OPTIONS",
-        }
+        assert parse("Access-Control-Allow-Methods") == {"GET", "POST", "OPTIONS"}
         assert parse("Access-Control-Allow-Headers") == {
             "Authorization",
             "Content-Type",
             "X-Created-By",
-            "X-Updated-By",
         }
         assert r.headers["Access-Control-Max-Age"] == "600"
 
@@ -289,12 +283,21 @@ class TestTheUiTokenIsScoped:
         """No trailing-slash or case folding: ("GET", "/mappings") is allowed
         and these are not.
 
-        Fail-closed today, and unasserted until now -- adding an rstrip("/") or
-        a .lower() anywhere on the way to the match left the whole file green.
-        Either one turns a near-miss into a hit, which is the ordinary way an
-        allowlist gets bypassed.
+        Either folding turns a near-miss into a hit, which is the ordinary way
+        an allowlist gets bypassed. A .lower() on the matched path passed the
+        whole file before this test existed.
         """
         assert _ui(client, "GET", path).status_code == 403
+
+    def test_the_preflight_advertises_nothing_the_allowlist_withholds(self) -> None:
+        """A preflight that promises DELETE promises a 403.
+
+        Allow-Methods and Allow-Headers are hand-written while the allowlist
+        is data, so they drift apart silently: the browser is told it may send
+        a method no allowed route accepts.
+        """
+        used = {m for m, _ in UI_ALLOWED_EXACT} | {m for m, _ in UI_ALLOWED_PATTERNS}
+        assert used == {"GET", "POST"}
 
     def test_every_pattern_has_a_sample(self) -> None:
         """So a pattern added without a sample fails instead of going unasserted."""

@@ -615,17 +615,16 @@ def test_create_app_wires_the_ui_token_and_origins_through(monkeypatch, reloaded
     external = "http://localhost:8098"
     ui = {"Authorization": "Bearer ui-s3cret", "Origin": origin}
 
-    # ONE request, decided entirely by the gate, carrying both halves of the
-    # claim: 403 rather than 401 proves ui_token was wired in (an unconfigured
-    # one makes this 401), and the CORS header on that same response proves
-    # ui_origins reached the after_request layer.
+    # ONE request, answered by the gate before dispatch, carrying both halves
+    # of the claim: 403 rather than 401 proves ui_token was wired in (an
+    # unconfigured one makes this 401), and the CORS header on that same
+    # response proves ui_origins reached the after_request layer.
     #
-    # Every route this test could use instead reaches a handler that opens a
-    # socket: each allowlisted route this app serves calls Postgres, and
-    # /health runs check_postgres AND check_duckdb. Those requests still
-    # "pass" -- a 500 satisfies "not 401", and a 503 still carries the CORS
-    # header -- which is exactly why asserting on them proved nothing while
-    # attempting real connections.
+    # Deliberately not asserting on a route that reaches a handler. Those open
+    # real sockets here -- Postgres or DuckDB depending on the route, and
+    # /health both -- and still answer, so a weak assertion passes while the
+    # connection is attempted: a 500 satisfies "not 401", and a 503 carries
+    # the CORS header just as well.
     denied = client.put("/config", base_url=external, headers=ui)
     assert denied.status_code == 403
     assert denied.headers["Access-Control-Allow-Origin"] == origin

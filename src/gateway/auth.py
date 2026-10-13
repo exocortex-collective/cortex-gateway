@@ -365,9 +365,13 @@ def init_auth(
         # else falls through to the normal gate.
         if request.method == "OPTIONS" and _allowed_origin():
             preflight = Response(status=204)
-            preflight.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+            # Only what a UI_ALLOWED route actually uses. Every allowed entry
+            # is a GET or a POST, and X-Updated-By is read only by the mapping
+            # PUT and DELETE, which the allowlist withholds -- advertising
+            # either would promise the browser a capability the token is 403 on.
+            preflight.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             preflight.headers["Access-Control-Allow-Headers"] = (
-                "Authorization, Content-Type, X-Created-By, X-Updated-By"
+                "Authorization, Content-Type, X-Created-By"
             )
             preflight.headers["Access-Control-Max-Age"] = "600"
             return preflight
