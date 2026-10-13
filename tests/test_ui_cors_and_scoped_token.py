@@ -68,9 +68,6 @@ PATTERN_SAMPLES = (
 
 # Routes the app under test serves. The gate runs before dispatch, so the
 # handlers only need to exist for the allowed cases to come back 200.
-
-# Routes the app under test serves. The gate runs before dispatch, so the
-# handlers only need to exist for the allowed cases to come back 200.
 DENIED_ROUTES = (
     ("/queue/failed/5", ("DELETE",)),
     ("/queue/failed/retry-all", ("POST",)),
@@ -126,14 +123,16 @@ def _ui(client: FlaskClient, method: str, path: str, **kw: Any) -> TestResponse:
 
 
 class TestPreflight:
-    def test_preflight_succeeds_with_no_credential(self, client) -> None:
+    def test_preflight_succeeds_with_no_credential(self, client: FlaskClient) -> None:
         """The one that breaks everything if missed: preflight cannot carry a token."""
         r = client.open("/queue/dead", method="OPTIONS", headers={"Origin": ORIGIN})
         assert r.status_code == 204
         assert r.headers["Access-Control-Allow-Origin"] == ORIGIN
         assert r.data == b""
 
-    def test_preflight_advertises_the_methods_and_headers_the_ui_sends(self, client) -> None:
+    def test_preflight_advertises_the_methods_and_headers_the_ui_sends(
+        self, client: FlaskClient
+    ) -> None:
         """Values, not just presence. Each was mutable with the suite green.
 
         A missing POST or Authorization here fails every write the extension
@@ -158,26 +157,28 @@ class TestPreflight:
         }
         assert r.headers["Access-Control-Max-Age"] == "600"
 
-    def test_preflight_for_an_unknown_path_looks_identical(self, client) -> None:
+    def test_preflight_for_an_unknown_path_looks_identical(self, client: FlaskClient) -> None:
         """So preflight cannot be used to enumerate the route table."""
         known = client.open("/queue/dead", method="OPTIONS", headers={"Origin": ORIGIN})
         unknown = client.open("/does/not/exist", method="OPTIONS", headers={"Origin": ORIGIN})
         assert unknown.status_code == known.status_code == 204
         assert unknown.data == known.data == b""
 
-    def test_preflight_from_another_origin_is_not_served(self, client) -> None:
+    def test_preflight_from_another_origin_is_not_served(self, client: FlaskClient) -> None:
         r = client.open("/queue/dead", method="OPTIONS", headers={"Origin": OTHER_ORIGIN})
         assert r.status_code != 204
         assert "Access-Control-Allow-Origin" not in r.headers
 
 
 class TestCorsHeaders:
-    def test_allow_origin_echoes_the_exact_origin_never_a_wildcard(self, client) -> None:
+    def test_allow_origin_echoes_the_exact_origin_never_a_wildcard(
+        self, client: FlaskClient
+    ) -> None:
         r = _ui(client, "GET", "/queue/dead")
         assert r.headers["Access-Control-Allow-Origin"] == ORIGIN
         assert r.headers["Access-Control-Allow-Origin"] != "*"
 
-    def test_another_origin_gets_no_cors_header(self, client) -> None:
+    def test_another_origin_gets_no_cors_header(self, client: FlaskClient) -> None:
         r = client.get(
             "/queue/dead",
             headers={"Authorization": f"Bearer {UI_TOKEN}", "Origin": OTHER_ORIGIN},
@@ -185,7 +186,9 @@ class TestCorsHeaders:
         assert "Access-Control-Allow-Origin" not in r.headers
 
     @pytest.mark.parametrize("origin", [None, ORIGIN, OTHER_ORIGIN])
-    def test_vary_origin_is_present_whatever_the_origin(self, client, origin) -> None:
+    def test_vary_origin_is_present_whatever_the_origin(
+        self, client: FlaskClient, origin: str | None
+    ) -> None:
         """A cache must never reuse an allowlisted response for another origin.
 
         Testing only the no-origin case left the allowlisted and preflight
@@ -194,7 +197,7 @@ class TestCorsHeaders:
         headers = {"Origin": origin} if origin else {}
         assert "Origin" in client.get("/health", headers=headers).headers.get("Vary", "")
 
-    def test_vary_origin_is_present_on_a_preflight(self, client) -> None:
+    def test_vary_origin_is_present_on_a_preflight(self, client: FlaskClient) -> None:
         r = client.open("/queue/dead", method="OPTIONS", headers={"Origin": ORIGIN})
         assert "Origin" in r.headers.get("Vary", "")
 
@@ -224,7 +227,7 @@ class TestCorsHeaders:
         values = {v.strip() for part in r.headers.getlist("Vary") for v in part.split(",")}
         assert values == {"Accept-Encoding", "Origin"}
 
-    def test_credentials_are_never_allowed(self, client) -> None:
+    def test_credentials_are_never_allowed(self, client: FlaskClient) -> None:
         """/oauth/start sets a Flask session cookie; it must not be rideable."""
         r = _ui(client, "GET", "/queue/dead")
         assert "Access-Control-Allow-Credentials" not in r.headers
@@ -237,7 +240,9 @@ class TestCorsHeaders:
 
 class TestTheUiTokenIsScoped:
     @pytest.mark.parametrize("method,path", sorted(UI_ALLOWED_EXACT))
-    def test_every_exact_entry_is_reachable(self, client, method, path) -> None:
+    def test_every_exact_entry_is_reachable(
+        self, client: FlaskClient, method: str, path: str
+    ) -> None:
         """Parametrized over the allowlist itself.
 
         A hand-copied subset is what let six entries be deleted with the suite
@@ -247,13 +252,20 @@ class TestTheUiTokenIsScoped:
         assert _ui(client, method, path).status_code == 200
 
     @pytest.mark.parametrize("method,path,_over,_wrong", PATTERN_SAMPLES)
-    def test_every_pattern_entry_is_reachable(self, client, method, path, _over, _wrong) -> None:
+    def test_every_pattern_entry_is_reachable(
+        self,
+        client: FlaskClient,
+        method: str,
+        path: str,
+        _over: tuple[str, ...],
+        _wrong: str,
+    ) -> None:
         assert _ui(client, method, path).status_code == 200
 
     @pytest.mark.parametrize(
         "method,over", [(m, o) for m, _p, overs, _w in PATTERN_SAMPLES for o in overs]
     )
-    def test_no_pattern_over_matches(self, client, method, over) -> None:
+    def test_no_pattern_over_matches(self, client: FlaskClient, method: str, over: str) -> None:
         """403 is the gate denying; anything else means the pattern matched.
 
         The over-match paths are deliberately unregistered, so reaching routing
@@ -262,13 +274,27 @@ class TestTheUiTokenIsScoped:
         assert _ui(client, method, over).status_code == 403
 
     @pytest.mark.parametrize("wrong_method,path", [(w, p) for _m, p, _o, w in PATTERN_SAMPLES])
-    def test_a_pattern_does_not_accept_another_method(self, client, wrong_method, path) -> None:
+    def test_a_pattern_does_not_accept_another_method(
+        self, client: FlaskClient, wrong_method: str, path: str
+    ) -> None:
         """The method is half of each pattern entry and was unasserted.
 
         Dropping `m == method` from the any() in _ui_route_allowed left the
         whole file green, so every GET-only pattern silently took POST too.
         """
         assert _ui(client, wrong_method, path).status_code == 403
+
+    @pytest.mark.parametrize("path", ["/mappings/", "/MAPPINGS", "/Mappings"])
+    def test_the_gate_matches_the_path_exactly(self, client: FlaskClient, path: str) -> None:
+        """No trailing-slash or case folding: ("GET", "/mappings") is allowed
+        and these are not.
+
+        Fail-closed today, and unasserted until now -- adding an rstrip("/") or
+        a .lower() anywhere on the way to the match left the whole file green.
+        Either one turns a near-miss into a hit, which is the ordinary way an
+        allowlist gets bypassed.
+        """
+        assert _ui(client, "GET", path).status_code == 403
 
     def test_every_pattern_has_a_sample(self) -> None:
         """So a pattern added without a sample fails instead of going unasserted."""
@@ -277,20 +303,20 @@ class TestTheUiTokenIsScoped:
     def test_the_allowlist_is_exactly_this(self) -> None:
         """A snapshot of the whole boundary, pinned by CONTENT.
 
-        The cases above are derived from the allowlist, which means the
-        allowlist cannot check itself: an entry deleted from it deletes its own
-        test case, and an entry CHANGED in place just moves the case. Measured
-        on this file, control 66 passed:
+        The cases above are derived from the allowlist, so the allowlist cannot
+        check itself: an entry deleted from it deletes its own test case, and an
+        entry changed IN PLACE just moves the case to the changed value. A count
+        catches the deletion and not the change -- which is how changing
+        ("POST", "/mappings") to PUT, a method the comment on UI_ALLOWED_EXACT
+        explicitly withholds, passed a suite pinned only by length.
 
-          delete ("GET", "/queue/stats")          -> 65 passed, nothing red
-          ("GET", "/queue/stats")  -> DELETE      -> 66 passed, nothing red
-          ("POST", "/mappings")    -> PUT         -> 66 passed, nothing red
-          ("GET", "/triage/stats") -> POST        -> 66 passed, nothing red
+        So the snapshot is the assertion: widening, narrowing or re-pointing
+        what the browser may reach has to be an edit here, in a diff a reviewer
+        reads.
 
-        A count caught the first and none of the others, and the second row is
-        a method the comment on UI_ALLOWED_EXACT explicitly withholds. So the
-        snapshot is the assertion: widening, narrowing or re-pointing what the
-        browser may reach has to be an edit here, in a diff a reviewer reads.
+        No pass counts in here on purpose. Two earlier versions of this
+        docstring quoted measurements that were correct when taken and wrong
+        two commits later, because every test added to this file moves them.
         """
         assert UI_ALLOWED_EXACT == frozenset(
             {
@@ -315,8 +341,11 @@ class TestTheUiTokenIsScoped:
     def test_the_allowlist_patterns_are_exactly_these(self) -> None:
         """Snapshot of the regex half, for the same reason, source text and all.
 
-        Pinning the pattern SOURCE is the point: loosening \\d+ to .+ leaves
-        every derived case passing, because the sample still matches.
+        Pinning the pattern SOURCE is what catches a regex loosened in place.
+        The over-match cases in PATTERN_SAMPLES catch it too, now that they
+        include a non-digit and an extra-segment path per pattern; before those
+        existed, widening a character class left every derived case passing,
+        because the matching sample still matched.
         """
         assert tuple((m, pat.pattern) for m, pat in UI_ALLOWED_PATTERNS) == (
             ("POST", r"^/queue/failed/\d+/retry$"),
@@ -340,7 +369,9 @@ class TestTheUiTokenIsScoped:
             ("DELETE", "/queue/failed/5", "destructive"),
         ],
     )
-    def test_everything_else_is_403_not_401(self, client, method, path, why) -> None:
+    def test_everything_else_is_403_not_401(
+        self, client: FlaskClient, method: str, path: str, why: str
+    ) -> None:
         """403, because the credential is valid and the ROUTE is not allowed.
 
         A 401 here would send the user to re-enter a token that was fine.
@@ -350,7 +381,9 @@ class TestTheUiTokenIsScoped:
         assert r.get_json()["error"] == "token not permitted for this route"
 
     @pytest.mark.parametrize("query", ["", "?preview=1", "?preview=true", "?preview=0"])
-    def test_rerun_is_denied_whatever_the_query_string(self, client, query) -> None:
+    def test_rerun_is_denied_whatever_the_query_string(
+        self, client: FlaskClient, query: str
+    ) -> None:
         """No query string buys access to a bulk enqueue.
 
         An earlier revision allowed ?preview=1 on the strength of a preview
@@ -361,12 +394,12 @@ class TestTheUiTokenIsScoped:
         """
         assert _ui(client, "POST", f"/triage/rerun{query}").status_code == 403
 
-    def test_the_full_token_still_reaches_everything(self, client) -> None:
+    def test_the_full_token_still_reaches_everything(self, client: FlaskClient) -> None:
         """The scoped token must not have narrowed the real one."""
         r = client.put("/config", headers={"Authorization": f"Bearer {API_TOKEN}"})
         assert r.status_code == 200
 
-    def test_a_wrong_token_is_401(self, client) -> None:
+    def test_a_wrong_token_is_401(self, client: FlaskClient) -> None:
         r = client.get("/queue/dead", headers={"Authorization": "Bearer nope", "Origin": ORIGIN})
         assert r.status_code == 401
 
@@ -456,12 +489,12 @@ class TestCorsOnRejections:
     way to express.
     """
 
-    def test_a_403_carries_the_cors_header(self, client) -> None:
+    def test_a_403_carries_the_cors_header(self, client: FlaskClient) -> None:
         r = _ui(client, "PUT", "/config")
         assert r.status_code == 403
         assert r.headers["Access-Control-Allow-Origin"] == ORIGIN
 
-    def test_a_401_carries_the_cors_header(self, client) -> None:
+    def test_a_401_carries_the_cors_header(self, client: FlaskClient) -> None:
         r = client.get("/queue/dead", headers={"Authorization": "Bearer nope", "Origin": ORIGIN})
         assert r.status_code == 401
         assert r.headers["Access-Control-Allow-Origin"] == ORIGIN
