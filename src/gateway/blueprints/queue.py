@@ -178,6 +178,9 @@ def _bulk(
             requested=ids,
             moved=moved,
             failed=[r["id"] for r in results if not r["ok"]],
+            # Ids with no outcome: empty unless an exception escaped, and
+            # then the one in flight may have committed.
+            unresolved=[i for i in ids if i not in {r["id"] for r in results}],
             remote_addr=request.remote_addr,
         )
     return results

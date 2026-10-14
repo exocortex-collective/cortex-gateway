@@ -413,6 +413,7 @@ class TestBulkActions:
         assert fields["requested"] == [7, 8]
         assert fields["moved"] == [7], "only the ids that actually moved"
         assert fields["failed"] == [8]
+        assert fields["unresolved"] == []
         # The exact value, not truthiness: request.host would also be truthy.
         assert fields["remote_addr"] == "127.0.0.1"
 
@@ -557,6 +558,9 @@ class TestBulkActions:
         audit = {c.args[0]: c.kwargs for c in log.info.call_args_list}["queue_bulk_action"]
         assert audit["requested"] == [1, 2, 3]
         assert audit["moved"] == [1]
+        assert audit["failed"] == []
+        # The interrupted id and the one never reached are both unaccounted for.
+        assert audit["unresolved"] == [2, 3]
         assert calls == [1, 2]
 
     @patch("gateway.blueprints.queue.DeadLetterManager")
