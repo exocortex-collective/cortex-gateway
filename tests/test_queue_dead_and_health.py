@@ -515,15 +515,23 @@ class TestBulkActions:
         # Every requested id, not just the first.
         assert [x["id"] for x in results] == [7, 8, 9]
         assert all(x["ok"] is False for x in results)
+        # Only the id that hit the error is reported as an error; the rest
+        # were never attempted because the connection is gone.
+        assert [x["why"] for x in results] == [
+            "error, see gateway logs",
+            "connection lost",
+            "connection lost",
+        ]
+        assert mgr.return_value.retry_job.call_count == 1
         rollbacks = [
             c.kwargs
             for c in log.warning.call_args_list
             if c.args[0] == "queue_bulk_rollback_failed"
         ]
-        assert rollbacks == [
-            {"action": "resubmit", "dead_id": i, "error_type": "RuntimeError"} for i in (7, 8, 9)
-        ]
-        assert "queue_bulk_action" in {c.args[0] for c in log.info.call_args_list}
+        assert rollbacks == [{"action": "resubmit", "dead_id": 7, "error_type": "RuntimeError"}]
+        audit = {c.args[0]: c.kwargs for c in log.info.call_args_list}["queue_bulk_action"]
+        assert audit["moved"] == []
+        assert audit["failed"] == [7, 8, 9]
 
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_one_raising_id_does_not_discard_the_others(self, mgr, conn, client):

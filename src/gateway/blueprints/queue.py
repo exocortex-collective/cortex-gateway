@@ -68,7 +68,7 @@ def _requested_ids() -> tuple[list[int] | None, str | None]:
     return list(dict.fromkeys(raw)), None
 
 
-def _rollback(conn: connection, action: str, dead_id: int) -> None:
+def _rollback(conn: connection, action: str, dead_id: int) -> bool:
     """Clear an aborted transaction so the ids behind this one still run.
 
     After an error the server refuses every later statement on the
@@ -80,9 +80,13 @@ def _rollback(conn: connection, action: str, dead_id: int) -> None:
     rolls back again, raises again, and never reaches put_connection, leaking
     the pool slot and skipping the audit line even though ids had been
     applied.
+
+    Returns False when the rollback itself failed, meaning the connection is
+    unusable.
     """
     try:
         conn.rollback()
+        return True
     except Exception as exc:
         logger.warning(
             "queue_bulk_rollback_failed",
@@ -90,6 +94,7 @@ def _rollback(conn: connection, action: str, dead_id: int) -> None:
             dead_id=dead_id,
             error_type=type(exc).__name__,
         )
+        return False
 
 
 def _from_database(exc: BaseException | None) -> bool:
@@ -127,11 +132,11 @@ def _bulk(
     results: list[dict[str, Any]] = []
     with ConnectionContext() as conn:
         manager = DeadLetterManager(conn)
-        for dead_id in ids:
+        for position, dead_id in enumerate(ids):
             try:
                 results.append(act(manager, dead_id))
             except Exception as exc:
-                _rollback(conn, action, dead_id)
+                usable = _rollback(conn, action, dead_id)
                 # The message is not logged: a psycopg2 error carries a DETAIL
                 # line holding the offending row's values. Anything else gets
                 # its traceback, so a programming error can be found.
@@ -143,6 +148,11 @@ def _bulk(
                     **({} if _from_database(exc) else {"exc_info": True}),
                 )
                 results.append({"id": dead_id, "ok": False, "why": "error, see gateway logs"})
+                if not usable:
+                    # Not attempted: every later call would fail the same way.
+                    rest = ids[position + 1 :]
+                    results += [{"id": i, "ok": False, "why": "connection lost"} for i in rest]
+                    break
     moved = [r["id"] for r in results if r["ok"]]
     # The gateway's own record of a bulk mutation and its caller. The
     # dead-letter rows also show what moved; this shows who asked and when,
