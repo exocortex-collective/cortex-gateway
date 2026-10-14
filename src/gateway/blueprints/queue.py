@@ -63,7 +63,34 @@ def _requested_ids() -> tuple[list[int] | None, str | None]:
         # isinstance(True, int) is True, and `ids: [true]` would otherwise
         # become dead-letter id 1 -- an unrelated payload resurrected.
         return None, "ids must all be integers"
-    return list(raw), None
+    # Deduplicated, order kept: a repeated id is acted on once and then
+    # refused by retried_at, so it would land in both `moved` and `failed`
+    # and make the audit line's counts disagree with what was requested.
+    return list(dict.fromkeys(raw)), None
+
+
+def _rollback(conn: Any, action: str, dead_id: int) -> None:
+    """Clear an aborted transaction so the ids behind this one still run.
+
+    After an error psycopg2 refuses every later statement on the transaction,
+    so without this one bad id fails all the ids behind it. Any caller that
+    swallows a database error owes the batch this call.
+
+    Guarded because a rollback on an already-closed connection raises, and
+    that exception would escape past ConnectionContext.__exit__ -- which
+    rolls back again, raises again, and never reaches put_connection, leaking
+    the pool slot and skipping the audit line even though ids had been
+    applied.
+    """
+    try:
+        conn.rollback()
+    except Exception as exc:
+        logger.warning(
+            "queue_bulk_rollback_failed",
+            action=action,
+            dead_id=dead_id,
+            error_type=type(exc).__name__,
+        )
 
 
 def _bulk(
@@ -73,19 +100,9 @@ def _bulk(
 ) -> list[dict[str, Any]]:
     """Run a per-id action and report each id's outcome.
 
-    Both routes promise per-item results, and without this an id that raised
-    took the whole call to a 500 -- losing every result, including the ids
-    that had already been applied. DeadLetterManager.retry_job and .dismiss
-    each commit for themselves, so there is nothing to commit here; what is
-    needed is that one bad id costs that id only.
-
-    The rollback is for the connection, not the data: after an error psycopg2
-    refuses every later statement on the transaction, so without it one bad
-    id would fail all the ids behind it. It is guarded because a rollback on
-    an already-closed connection raises, and that exception would escape past
-    ConnectionContext.__exit__ -- which rolls back again, raises again, and
-    never reaches put_connection, leaking the pool slot and skipping the
-    audit line below even though ids had been applied.
+    Both routes promise per-item results: one bad id costs that id only.
+    DeadLetterManager.retry_job and .dismiss each commit for themselves, so
+    there is nothing to commit here.
     """
     results: list[dict[str, Any]] = []
     with ConnectionContext() as conn:
@@ -94,15 +111,7 @@ def _bulk(
             try:
                 results.append(act(manager, dead_id))
             except Exception as exc:
-                try:
-                    conn.rollback()
-                except Exception as rollback_exc:
-                    logger.warning(
-                        "queue_bulk_rollback_failed",
-                        action=action,
-                        dead_id=dead_id,
-                        error_type=type(rollback_exc).__name__,
-                    )
+                _rollback(conn, action, dead_id)
                 # The message is not logged: a psycopg2 error carries a DETAIL
                 # line holding the offending row's values.
                 logger.warning(
@@ -245,6 +254,11 @@ def resubmit_dead() -> Response | tuple[Response, int]:
         return jsonify({"error": error}), 400
 
     def _one(manager: DeadLetterManager, dead_id: int) -> dict[str, Any]:
+        # retry_job's default priority of 0 is kept deliberately. Its
+        # docstring reserves -100 for bulk or historical retries, meaning the
+        # few-hundred-row sweeps that would otherwise drain ahead of live
+        # mail; this route is an operator picking rows out of a UI list,
+        # capped at BULK_MAX, and they want them back at normal priority.
         if not manager.retry_job(dead_id):
             return {"id": dead_id, "ok": False, "why": manager.why_not_retryable(dead_id)}
         # retry_job has COMMITTED by this point, so the id has moved whatever
@@ -260,6 +274,11 @@ def resubmit_dead() -> Response | tuple[Response, int]:
                 dead_id=dead_id,
                 error_type=type(exc).__name__,
             )
+            # Swallowing a database error here would leave the transaction
+            # aborted, and _bulk's own rollback never runs because this id
+            # reports ok. The NEXT id would then fail in retry_job and be
+            # reported as a failure without having been attempted.
+            _rollback(manager.conn, "resubmit", dead_id)
             job = None
         return {"id": dead_id, "ok": True, "new_id": job["retried_as"] if job else None}
 

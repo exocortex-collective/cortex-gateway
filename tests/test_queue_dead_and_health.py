@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from cortex_utils.queue import DeadLetterManager
 from flask import Flask
 
 from gateway.blueprints.queue import BULK_MAX, queue_bp
@@ -380,6 +381,31 @@ class TestBulkActions:
         audit = next(c for c in log.info.call_args_list if c.args[0] == "queue_bulk_action")
         assert audit.kwargs["moved"] == [7], "the audit line must show it moved"
 
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_a_failed_readback_does_not_fail_the_next_id(self, mgr, conn, client):
+        """A swallowed database error leaves the transaction aborted.
+
+        The read-back reports `ok` regardless, so _bulk's own rollback never
+        runs for this id. Without a rollback here psycopg2 refuses the next
+        statement, and the following id comes back failed without having been
+        attempted.
+        """
+        m = mgr.return_value
+        m.retry_job.return_value = True
+        m.get_job.side_effect = [RuntimeError("readback blew up"), {"retried_as": 99}]
+        # The real manager holds the connection it was built with, which is
+        # how the read-back reaches it; the mock has to be told.
+        assert DeadLetterManager(conn).conn is conn
+        m.conn = conn
+
+        data = client.post("/queue/dead/resubmit", json={"ids": [7, 8]}).get_json()
+        assert data["results"] == [
+            {"id": 7, "ok": True, "new_id": None},
+            {"id": 8, "ok": True, "new_id": 99},
+        ]
+        assert conn.rollback.call_count == 1, "the aborted transaction must be cleared"
+        assert m.retry_job.call_args_list == [call(7), call(8)], "id 8 was still attempted"
+
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_the_bulk_action_is_audited(self, mgr, log, conn, client):
@@ -468,7 +494,31 @@ class TestBulkActions:
         data = r.get_json()
         assert [x["ok"] for x in data["results"]] == [True, False, True]
         assert data["resubmitted"] == 2
-        assert conn.rollback.called, "the failed id must not poison the transaction"
+        # Exactly once, not merely "called": a rollback after every success
+        # would also satisfy `.called`, and would discard nothing visible here
+        # because the manager commits for itself.
+        assert conn.rollback.call_count == 1, "once, for the failed id only"
+
+    @patch("gateway.blueprints.queue.logger")
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_a_repeated_id_is_acted_on_once(self, mgr, log, conn, client):
+        """Otherwise the same id lands in both `moved` and `failed`.
+
+        The second attempt is refused by retried_at, so an audit line for
+        ids [5, 5] claimed three outcomes for two requested ids and reported
+        id 5 as having both moved and failed.
+        """
+        m = mgr.return_value
+        m.retry_job.return_value = True
+        m.get_job.return_value = {"retried_as": 1}
+
+        data = client.post("/queue/dead/resubmit", json={"ids": [5, 5]}).get_json()
+        assert data["results"] == [{"id": 5, "ok": True, "new_id": 1}]
+        assert m.retry_job.call_args_list == [call(5)]
+        audit = next(c for c in log.info.call_args_list if c.args[0] == "queue_bulk_action")
+        assert audit.kwargs["requested"] == [5]
+        assert audit.kwargs["moved"] == [5]
+        assert audit.kwargs["failed"] == []
 
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_the_gateway_does_not_commit_because_the_manager_does(self, mgr, conn, client):

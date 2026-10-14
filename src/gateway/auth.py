@@ -388,14 +388,11 @@ def init_auth(
         # else falls through to the normal gate.
         if request.method == "OPTIONS" and _allowed_origin():
             preflight = Response(status=204)
-            # DELETE and X-Updated-By are advertised although NO UI_ALLOWED
-            # route accepts them, and that is deliberate. A preflight grants
-            # nothing -- the gate decides, and a withheld route is 403 either
-            # way -- so narrowing this buys no security. What it costs is the
-            # legibility the 403 exists for: a method the preflight omits is
-            # blocked by the BROWSER, and the extension sees an opaque failed
-            # fetch with no status instead of "token not permitted for this
-            # route". Narrowed for one round and reverted; see PR #40.
+            # DELETE and X-Updated-By are advertised although no UI_ALLOWED
+            # route accepts them. A preflight is not a security control -- the
+            # gate decides, and a withheld route is 403 either way -- but a
+            # method omitted here is blocked by the BROWSER, so the extension
+            # sees an opaque failed fetch instead of the deliberate 403.
             preflight.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
             preflight.headers["Access-Control-Allow-Headers"] = (
                 "Authorization, Content-Type, X-Created-By, X-Updated-By"

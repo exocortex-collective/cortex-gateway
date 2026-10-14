@@ -1,16 +1,4 @@
-"""`?preview=1` answers "how many would this touch" without touching anything.
-
-Before this, a UI could not ask that question: the only way to find out what
-POST /triage/rerun matched was to run it and read the count afterwards, by
-which point thousands of rows were queued at a caller-chosen priority.
-
-PREVIEW EXECUTES THE REAL STATEMENT AND ROLLS BACK rather than rewriting it
-into a COUNT. The statement carries DISTINCT ON, a NOT EXISTS de-duplication
-and ON CONFLICT DO NOTHING; a separate counting query would have to restate
-all three and would drift from them on the next edit, reporting a number the
-real call does not produce. So the tests below assert the ROLLBACK, not a
-query string.
-"""
+"""`?preview=1` answers "how many would this touch" without touching anything."""
 
 from __future__ import annotations
 
@@ -93,13 +81,47 @@ class TestPreview:
         assert "DISTINCT ON (er.gmail_id)" in preview_sql
         assert "NOT EXISTS" in preview_sql, "force is false, so the dedup applies"
 
+    def test_the_label_branch_binds_priority_cutoff_and_label(self, conn, client):
+        """Each branch builds its own parameters, so each needs pinning.
+
+        Parity with the non-preview path cannot catch these: both sides come
+        from the same builder, so a mangled label or an off-by-one cutoff
+        satisfies an equality check while the preview reports a count for
+        mail the real call would not touch.
+        """
+        frozen = datetime(2026, 10, 13, 12, 0, 0, tzinfo=UTC)
+        with patch("gateway.blueprints.triage.datetime") as dt:
+            dt.now.return_value = frozen
+            client.post(
+                "/triage/rerun?preview=1",
+                json={"label": "Cortex/Uncategorized", "days": 3, "priority": -50},
+            )
+        cur = conn.cursor.return_value.__enter__.return_value
+        sql, params = cur.execute.call_args[0]
+        assert params == (
+            -50,
+            (frozen - timedelta(days=3)).isoformat(),
+            "Cortex/Uncategorized",
+        ), "priority, the days cutoff, and the label exactly as given"
+        assert "JOIN classifications c" in sql
+
+    def test_the_gmail_ids_branch_binds_priority_then_every_id(self, conn, client):
+        """A truncated id list would preview a count for mail it never queues."""
+        client.post(
+            "/triage/rerun?preview=1",
+            json={"gmail_ids": ["19ae00", "19ae01", "19ae02"], "priority": -50},
+        )
+        cur = conn.cursor.return_value.__enter__.return_value
+        sql, params = cur.execute.call_args[0]
+        assert params == (-50, "19ae00", "19ae01", "19ae02")
+        assert sql.count("%s") == 4, "one for priority, one per id"
+
     def test_a_sender_is_escaped_before_it_becomes_a_like_pattern(self, conn, client):
         """Only `*` is a wildcard; LIKE's own metacharacters are escaped.
 
         Unescaped, `a_b@example.com` matches `aXb@example.com` and a `%`
-        anywhere matches everything after it, so a rerun aimed at one sender
-        would re-triage mail from others. No other test here uses a sender
-        containing % or _, so none of them exercises the escaping.
+        matches any run of characters, so a rerun aimed at one sender would
+        re-triage mail from others.
         """
         client.post(
             "/triage/rerun?preview=1",

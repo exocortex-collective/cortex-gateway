@@ -94,10 +94,8 @@ def rerun_triage():
     label = data.get("label")
     force = data.get("force", False)
 
-    # days and priority were previously unvalidated. A string `days` reached
-    # timedelta(days="7") and raised TypeError, which Flask turned into a 500
-    # -- a caller error reported as a server fault. bool is excluded because
-    # isinstance(True, int) is True and `days: true` would mean one day.
+    # bool is excluded because isinstance(True, int) is True, so `days: true`
+    # would otherwise mean one day.
     days = data.get("days", 7)
     if isinstance(days, bool) or not isinstance(days, int) or days < 1:
         return jsonify({"error": "'days' must be an integer >= 1"}), 400
@@ -133,10 +131,7 @@ def rerun_triage():
         """
         # list[Any], not list[str | int]: a list is INVARIANT, so the later
         # branches assigning list[int] and list[object] are rejected against
-        # the narrower annotation. That only started failing once `priority`
-        # was validated to int above -- while it was Any, every branch
-        # inferred list[Any] and agreed by accident. Caught by the pre-commit
-        # mypy (1.5.1), not by the newer one in this venv.
+        # the narrower annotation.
         params: list[Any] = [priority] + gmail_ids
     elif senders:
         # Sender filter with date range - join with emails_parsed to filter by from_addr
