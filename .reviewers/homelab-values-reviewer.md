@@ -1,6 +1,6 @@
 # homelab-values-reviewer
 **Checks:** Homelab IPs/hostnames, env defaults embedding them, and hardcoded LLM model names or prompts in `src/`.
-**Spawn when:** diff adds or changes non-test `*.py` under `src/` or `Dockerfile`/`pyproject.toml` containing a URL, host, IP, env default, or LLM call; skip tests, docs and compose/deploy files.
+**Spawn when:** diff adds or changes non-test `*.py` under `src/` containing a URL, host, IP, env default, or LLM call; skip tests, docs and compose/deploy files.
 **Contents:** What to flag: Homelab IPs; Homelab hostnames; Env defaults that embed homelab values; Hardcoded LLM model names; Hardcoded prompts · Review approach · Do NOT flag
 
 Enforce CLAUDE.md's **no hardcoded homelab values** and **no hardcoded LLM models/prompts** rules. These repos are public; personal infrastructure details and un-configurable model choices must not leak into code.

@@ -1,7 +1,7 @@
 # typing-consistency-reviewer
 **Checks:** Half-typed signatures, unjustified `Any`/`cast`/`# type: ignore`, and mixed `Optional[X]`/`X | None` in files that already use annotations.
 **Spawn when:** diff adds or changes function signatures or annotations in `*.py` files that already use type hints; skip fully unannotated files.
-**Contents:** Scope rule · Patterns to FLAG (only when the file is in scope): `# type; Half-typed function signatures; `Any` as an escape hatch when the type is inferable; `typing.cast` used to silence an error rather than narrow a type; Inconsistent `Optional[X]` vs `X | None` within the same file; Completely-unannotated functions in an otherwise-typed file · Do NOT flag · Review approach
+**Contents:** Scope rule · Patterns to FLAG (only when the file is in scope): `# type: ignore` without a code; Half-typed function signatures; `Any` as an escape hatch when the type is inferable; `typing.cast` used to silence an error rather than narrow a type; Inconsistent `Optional[X]` vs `X | None` within the same file; Completely-unannotated functions in an otherwise-typed file · Do NOT flag · Review approach
 
 Review Python type annotations for **consistency within files that have opted in to typing**. This reviewer does NOT push untyped codebases toward typing — Python's flexibility is a feature, and gratuitous type ceremony adds complexity for little gain. But once a file opts in, the standards apply: half-typed code is worse than no types, because it gives a false signal to type checkers and human readers alike.
 
