@@ -92,6 +92,17 @@ def _rollback(conn: connection, action: str, dead_id: int) -> None:
         )
 
 
+def _from_database(exc: BaseException | None) -> bool:
+    """True if exc, or anything it was raised from or during, is a psycopg2 error."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, psycopg2.Error):
+            return True
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 def _bulk(
     ids: list[int],
     act: Callable[[DeadLetterManager, int], dict[str, Any]],
@@ -119,7 +130,7 @@ def _bulk(
                     action=action,
                     dead_id=dead_id,
                     error_type=type(exc).__name__,
-                    **({} if isinstance(exc, psycopg2.Error) else {"exc_info": True}),
+                    **({} if _from_database(exc) else {"exc_info": True}),
                 )
                 results.append({"id": dead_id, "ok": False, "why": "error, see gateway logs"})
     moved = [r["id"] for r in results if r["ok"]]

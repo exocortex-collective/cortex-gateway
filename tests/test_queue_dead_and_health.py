@@ -416,21 +416,45 @@ class TestBulkActions:
         # The exact value, not truthiness: request.host would also be truthy.
         assert fields["remote_addr"] == "127.0.0.1"
 
+    @pytest.mark.parametrize(
+        "db_error", [psycopg2.errors.UniqueViolation, psycopg2.OperationalError]
+    )
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")
-    def test_a_raising_id_is_audited_without_its_error_message(self, mgr, log, conn, client):
+    def test_a_raising_id_is_audited_without_its_error_message(
+        self, mgr, log, conn, client, db_error
+    ):
         """A psycopg2 message carries a DETAIL line holding row values."""
-        mgr.return_value.retry_job.side_effect = psycopg2.errors.UniqueViolation(
-            "DETAIL: Key (x)=(secret)"
-        )
+        mgr.return_value.retry_job.side_effect = db_error("DETAIL: Key (x)=(secret)")
         client.post("/queue/dead/resubmit", json={"ids": [7]})
         warnings = {c.args[0]: c.kwargs for c in log.warning.call_args_list}
         assert warnings["queue_bulk_item_failed"] == {
             "action": "resubmit",
             "dead_id": 7,
-            "error_type": "UniqueViolation",
+            "error_type": db_error.__name__,
         }
         assert not any("secret" in str(v) for v in warnings["queue_bulk_item_failed"].values())
+
+    @pytest.mark.parametrize("how", ["cause", "context"])
+    @patch("gateway.blueprints.queue.logger")
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_a_database_error_behind_another_exception_gets_no_traceback(
+        self, mgr, log, conn, client, how
+    ):
+        """The traceback prints every chained exception's message."""
+
+        def raising(*_):
+            try:
+                raise psycopg2.errors.UniqueViolation("DETAIL: Key (x)=(secret)")
+            except psycopg2.Error as db:
+                if how == "cause":
+                    raise RuntimeError("wrapped") from db
+                raise RuntimeError("wrapped")
+
+        mgr.return_value.retry_job.side_effect = raising
+        client.post("/queue/dead/resubmit", json={"ids": [7]})
+        warnings = {c.args[0]: c.kwargs for c in log.warning.call_args_list}
+        assert "exc_info" not in warnings["queue_bulk_item_failed"]
 
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")
