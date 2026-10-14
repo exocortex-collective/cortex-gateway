@@ -13,11 +13,12 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import psycopg2.errors
 import pytest
 from cortex_utils.queue import DeadLetterManager
 from flask import Flask
 
-from gateway.blueprints.queue import BULK_MAX, queue_bp
+from gateway.blueprints.queue import BULK_MAX, _from_database, queue_bp
 
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
 
@@ -415,19 +416,84 @@ class TestBulkActions:
         # The exact value, not truthiness: request.host would also be truthy.
         assert fields["remote_addr"] == "127.0.0.1"
 
+    @pytest.mark.parametrize(
+        "db_error", [psycopg2.errors.UniqueViolation, psycopg2.OperationalError]
+    )
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")
-    def test_a_raising_id_is_audited_without_its_error_message(self, mgr, log, conn, client):
+    def test_a_raising_id_is_audited_without_its_error_message(
+        self, mgr, log, conn, client, db_error
+    ):
         """A psycopg2 message carries a DETAIL line holding row values."""
-        mgr.return_value.retry_job.side_effect = RuntimeError("DETAIL: Key (x)=(secret)")
+        mgr.return_value.retry_job.side_effect = db_error("DETAIL: Key (x)=(secret)")
         client.post("/queue/dead/resubmit", json={"ids": [7]})
         warnings = {c.args[0]: c.kwargs for c in log.warning.call_args_list}
         assert warnings["queue_bulk_item_failed"] == {
             "action": "resubmit",
             "dead_id": 7,
-            "error_type": "RuntimeError",
+            "error_type": db_error.__name__,
         }
         assert not any("secret" in str(v) for v in warnings["queue_bulk_item_failed"].values())
+
+    @pytest.mark.parametrize("how", ["cause", "context", "two_hops", "mixed", "group"])
+    @patch("gateway.blueprints.queue.logger")
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_a_database_error_behind_another_exception_gets_no_traceback(
+        self, mgr, log, conn, client, how
+    ):
+        """The traceback prints every chained exception's message."""
+
+        def raising(*_):
+            try:
+                raise psycopg2.errors.UniqueViolation("DETAIL: Key (x)=(secret)")
+            except psycopg2.Error as db:
+                caught = db
+                if how == "context":
+                    raise RuntimeError("wrapped")
+                if how == "mixed":
+                    # cause is not a database error; the database error is
+                    # only the implicit context.
+                    raise RuntimeError("wrapped") from ValueError("other")
+                if how == "two_hops":
+                    try:
+                        raise RuntimeError("inner") from db
+                    except RuntimeError as inner:
+                        raise TypeError("outer") from inner
+            # Raised outside the handler, so there is no __context__ and the
+            # database error is reachable only through the link under test.
+            if how == "cause":
+                wrapper = RuntimeError("wrapped")
+                wrapper.__cause__ = caught
+                raise wrapper
+            raise ExceptionGroup("g", [caught])
+
+        mgr.return_value.retry_job.side_effect = raising
+        client.post("/queue/dead/resubmit", json={"ids": [7]})
+        warnings = {c.args[0]: c.kwargs for c in log.warning.call_args_list}
+        assert "exc_info" not in warnings["queue_bulk_item_failed"]
+
+    def test_an_unrelated_exceptions_attribute_is_ignored(self):
+        exc = RuntimeError("x")
+        exc.exceptions = 5  # type: ignore[attr-defined]
+        assert _from_database(exc) is False
+
+    def test_a_cyclic_exception_chain_terminates(self):
+        a, b = RuntimeError("a"), RuntimeError("b")
+        a.__cause__, b.__cause__ = b, a
+        assert _from_database(a) is False
+
+    @patch("gateway.blueprints.queue.logger")
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_a_non_database_error_is_logged_with_its_traceback(self, mgr, log, conn, client):
+        mgr.return_value.retry_job.side_effect = TypeError("API drift")
+        client.post("/queue/dead/resubmit", json={"ids": [7]})
+        warnings = {c.args[0]: c.kwargs for c in log.warning.call_args_list}
+        assert warnings["queue_bulk_item_failed"] == {
+            "action": "resubmit",
+            "dead_id": 7,
+            "error_type": "TypeError",
+            "exc_info": True,
+        }
 
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")

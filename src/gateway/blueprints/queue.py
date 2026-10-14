@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from typing import Any
 
+import psycopg2
 from cortex_utils.logging import get_logger
 from cortex_utils.queue import DeadLetterManager
 from cortex_utils.queue import inspect as queue_inspect
@@ -91,6 +92,27 @@ def _rollback(conn: connection, action: str, dead_id: int) -> None:
         )
 
 
+def _from_database(exc: BaseException | None) -> bool:
+    """True if a psycopg2 error is anywhere a traceback of exc would print.
+
+    Both links are followed, not just the one traceback prints, so the answer
+    errs toward withholding.
+    """
+    seen: set[int] = set()
+    todo: list[BaseException | None] = [exc]
+    while todo:
+        cur = todo.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        if isinstance(cur, psycopg2.Error):
+            return True
+        seen.add(id(cur))
+        todo += [cur.__cause__, cur.__context__]
+        if isinstance(cur, BaseExceptionGroup):
+            todo += cur.exceptions
+    return False
+
+
 def _bulk(
     ids: list[int],
     act: Callable[[DeadLetterManager, int], dict[str, Any]],
@@ -111,12 +133,14 @@ def _bulk(
             except Exception as exc:
                 _rollback(conn, action, dead_id)
                 # The message is not logged: a psycopg2 error carries a DETAIL
-                # line holding the offending row's values.
+                # line holding the offending row's values. Anything else gets
+                # its traceback, so a programming error can be found.
                 logger.warning(
                     "queue_bulk_item_failed",
                     action=action,
                     dead_id=dead_id,
                     error_type=type(exc).__name__,
+                    **({} if _from_database(exc) else {"exc_info": True}),
                 )
                 results.append({"id": dead_id, "ok": False, "why": "error, see gateway logs"})
     moved = [r["id"] for r in results if r["ok"]]
