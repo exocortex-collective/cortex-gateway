@@ -101,7 +101,7 @@ def check_postgres() -> tuple[str, bool]:
             cur.execute("SELECT 1")
         return ("postgres", True)
     except Exception as e:
-        logger.warning("postgres_health_check_failed", error=e)
+        logger.warning("postgres_health_check_failed", error_type=type(e).__name__)
         return ("postgres", False)
 
 
@@ -111,7 +111,7 @@ def check_duckdb() -> tuple[str, bool]:
         resp = httpx.get(f"{config.duckdb_api_url}/health", timeout=5.0)
         return ("duckdb", resp.status_code == 200)
     except httpx.RequestError as e:
-        logger.warning("duckdb_health_check_failed", error=e)
+        logger.warning("duckdb_health_check_failed", error_type=type(e).__name__)
         return ("duckdb", False)
 
 
