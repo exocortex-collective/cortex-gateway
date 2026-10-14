@@ -18,7 +18,7 @@ import pytest
 from cortex_utils.queue import DeadLetterManager
 from flask import Flask
 
-from gateway.blueprints.queue import BULK_MAX, _from_database, queue_bp
+from gateway.blueprints.queue import BULK_MAX, _bulk, _from_database, queue_bp
 
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
 
@@ -413,6 +413,7 @@ class TestBulkActions:
         assert fields["requested"] == [7, 8]
         assert fields["moved"] == [7], "only the ids that actually moved"
         assert fields["failed"] == [8]
+        assert fields["unresolved"] == []
         # The exact value, not truthiness: request.host would also be truthy.
         assert fields["remote_addr"] == "127.0.0.1"
 
@@ -538,6 +539,29 @@ class TestBulkActions:
         audit = {c.args[0]: c.kwargs for c in log.info.call_args_list}["queue_bulk_action"]
         assert audit["moved"] == []
         assert audit["failed"] == [7, 8, 9]
+
+    @patch("gateway.blueprints.queue.logger")
+    def test_the_audit_line_survives_a_base_exception(self, log, conn):
+        """A worker timeout or interrupt must not erase who asked."""
+        calls = []
+
+        def act(_manager, dead_id):
+            calls.append(dead_id)
+            if dead_id == 2:
+                raise KeyboardInterrupt
+            return {"id": dead_id, "ok": True}
+
+        with Flask("t").test_request_context():
+            with patch("gateway.blueprints.queue.DeadLetterManager"):
+                with pytest.raises(KeyboardInterrupt):
+                    _bulk([1, 2, 3], act, "dismiss")
+        audit = {c.args[0]: c.kwargs for c in log.info.call_args_list}["queue_bulk_action"]
+        assert audit["requested"] == [1, 2, 3]
+        assert audit["moved"] == [1]
+        assert audit["failed"] == []
+        # The interrupted id and the one never reached are both unaccounted for.
+        assert audit["unresolved"] == [2, 3]
+        assert calls == [1, 2]
 
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_one_raising_id_does_not_discard_the_others(self, mgr, conn, client):

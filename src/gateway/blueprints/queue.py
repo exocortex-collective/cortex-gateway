@@ -118,18 +118,13 @@ def _from_database(exc: BaseException | None) -> bool:
     return False
 
 
-def _bulk(
+def _apply(
     ids: list[int],
     act: Callable[[DeadLetterManager, int], dict[str, Any]],
     action: str,
-) -> list[dict[str, Any]]:
-    """Run a per-id action and report each id's outcome.
-
-    Both routes promise per-item results: one bad id costs that id only.
-    DeadLetterManager.retry_job and .dismiss each commit for themselves, so
-    there is nothing to commit here.
-    """
-    results: list[dict[str, Any]] = []
+    results: list[dict[str, Any]],
+) -> None:
+    """Run act over ids on one connection, appending each outcome to results."""
     with ConnectionContext() as conn:
         manager = DeadLetterManager(conn)
         for position, dead_id in enumerate(ids):
@@ -154,18 +149,40 @@ def _bulk(
                     logger.warning("queue_bulk_connection_lost", action=action, skipped=rest)
                     results += [{"id": i, "ok": False, "why": "connection lost"} for i in rest]
                     break
-    moved = [r["id"] for r in results if r["ok"]]
-    # The gateway's own record of a bulk mutation and its caller. The
-    # dead-letter rows also show what moved; this shows who asked and when,
-    # and is the only place a request that moved nothing appears at all.
-    logger.info(
-        "queue_bulk_action",
-        action=action,
-        requested=ids,
-        moved=moved,
-        failed=[r["id"] for r in results if not r["ok"]],
-        remote_addr=request.remote_addr,
-    )
+
+
+def _bulk(
+    ids: list[int],
+    act: Callable[[DeadLetterManager, int], dict[str, Any]],
+    action: str,
+) -> list[dict[str, Any]]:
+    """Run a per-id action and report each id's outcome.
+
+    Both routes promise per-item results: one bad id costs that id only.
+    DeadLetterManager.retry_job and .dismiss each commit for themselves, so
+    there is nothing to commit here.
+    """
+    results: list[dict[str, Any]] = []
+    try:
+        _apply(ids, act, action, results)
+    finally:
+        # In a finally so that even a BaseException (a worker timeout, an
+        # interrupt) leaves the record of who asked for ids already committed.
+        moved = [r["id"] for r in results if r["ok"]]
+        # The gateway's own record of a bulk mutation and its caller. The
+        # dead-letter rows also show what moved; this shows who asked and when,
+        # and is the only place a request that moved nothing appears at all.
+        logger.info(
+            "queue_bulk_action",
+            action=action,
+            requested=ids,
+            moved=moved,
+            failed=[r["id"] for r in results if not r["ok"]],
+            # Ids with no outcome: empty unless an exception escaped, and
+            # then the one in flight may have committed.
+            unresolved=[i for i in ids if i not in {r["id"] for r in results}],
+            remote_addr=request.remote_addr,
+        )
     return results
 
 
