@@ -18,7 +18,7 @@ import pytest
 from cortex_utils.queue import DeadLetterManager
 from flask import Flask
 
-from gateway.blueprints.queue import BULK_MAX, queue_bp
+from gateway.blueprints.queue import BULK_MAX, _from_database, queue_bp
 
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
 
@@ -435,7 +435,7 @@ class TestBulkActions:
         }
         assert not any("secret" in str(v) for v in warnings["queue_bulk_item_failed"].values())
 
-    @pytest.mark.parametrize("how", ["cause", "context"])
+    @pytest.mark.parametrize("how", ["cause", "context", "two_hops", "mixed", "group"])
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_a_database_error_behind_another_exception_gets_no_traceback(
@@ -449,12 +449,32 @@ class TestBulkActions:
             except psycopg2.Error as db:
                 if how == "cause":
                     raise RuntimeError("wrapped") from db
-                raise RuntimeError("wrapped")
+                if how == "context":
+                    raise RuntimeError("wrapped")
+                if how == "mixed":
+                    # cause is not a database error; the database error is
+                    # only the implicit context.
+                    raise RuntimeError("wrapped") from ValueError("other")
+                if how == "group":
+                    caught = db
+                else:
+                    try:
+                        raise RuntimeError("inner") from db
+                    except RuntimeError as inner:
+                        raise TypeError("outer") from inner
+            # Raised outside the handler, so the group has no __context__
+            # and the database error is reachable only through .exceptions.
+            raise ExceptionGroup("g", [caught])
 
         mgr.return_value.retry_job.side_effect = raising
         client.post("/queue/dead/resubmit", json={"ids": [7]})
         warnings = {c.args[0]: c.kwargs for c in log.warning.call_args_list}
         assert "exc_info" not in warnings["queue_bulk_item_failed"]
+
+    def test_a_cyclic_exception_chain_terminates(self):
+        a, b = RuntimeError("a"), RuntimeError("b")
+        a.__cause__, b.__cause__ = b, a
+        assert _from_database(a) is False
 
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")

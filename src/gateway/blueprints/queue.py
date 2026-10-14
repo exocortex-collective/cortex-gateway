@@ -93,13 +93,21 @@ def _rollback(conn: connection, action: str, dead_id: int) -> None:
 
 
 def _from_database(exc: BaseException | None) -> bool:
-    """True if exc, or anything it was raised from or during, is a psycopg2 error."""
+    """True if a psycopg2 error is anywhere a traceback of exc would print.
+
+    Both links are followed, not just the one traceback prints, so the answer
+    errs toward withholding.
+    """
     seen: set[int] = set()
-    while exc is not None and id(exc) not in seen:
-        if isinstance(exc, psycopg2.Error):
+    todo: list[BaseException | None] = [exc]
+    while todo:
+        cur = todo.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        if isinstance(cur, psycopg2.Error):
             return True
-        seen.add(id(exc))
-        exc = exc.__cause__ or exc.__context__
+        seen.add(id(cur))
+        todo += [cur.__cause__, cur.__context__, *getattr(cur, "exceptions", ())]
     return False
 
 
