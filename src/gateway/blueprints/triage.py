@@ -1,12 +1,17 @@
 """Triage-related API endpoints."""
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
+from cortex_utils.logging import get_logger
 from flask import Blueprint, jsonify, request
 
+from gateway.auth import is_preview
 from gateway.services import postgres
+from gateway.services.postgres import ConnectionContext
 
 triage_bp = Blueprint("triage", __name__)
+logger = get_logger()
 
 
 @triage_bp.route("/stats")
@@ -87,9 +92,16 @@ def rerun_triage():
     senders = [s for s in senders_raw or [] if s]
 
     label = data.get("label")
-    days = data.get("days", 7)
     force = data.get("force", False)
+
+    # bool is excluded because isinstance(True, int) is True, so `days: true`
+    # would otherwise mean one day.
+    days = data.get("days", 7)
+    if isinstance(days, bool) or not isinstance(days, int) or days < 1:
+        return jsonify({"error": "'days' must be an integer >= 1"}), 400
     priority = data.get("priority", -100)
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        return jsonify({"error": "'priority' must be an integer"}), 400
 
     if not gmail_ids and not label and not senders:
         return jsonify({"error": "Must specify gmail_ids, label, or senders filter"}), 400
@@ -117,7 +129,15 @@ def rerun_triage():
             FROM emails_raw er
             WHERE er.gmail_id IN ({placeholders})
         """
-        params: list[str | int] = [priority] + gmail_ids
+        # list[Any], not list[str | int]: a list is INVARIANT, so the
+        # narrower annotation rejects both this assignment (list[int]) and
+        # the senders branch below (list[object]).
+        #
+        # Only the pre-commit mypy pin (1.5.1) rejects them; the newer mypy
+        # in this venv accepts the narrower type, so `uv run mypy` alone
+        # shows nothing and makes this look like dead weight. Narrowing it
+        # blocks every commit.
+        params: list[Any] = [priority] + gmail_ids
     elif senders:
         # Sender filter with date range - join with emails_parsed to filter by from_addr
         cutoff = datetime.now(UTC) - timedelta(days=days)
@@ -184,10 +204,63 @@ def rerun_triage():
     # Handle any race conditions with existing queue entries
     query += " ON CONFLICT DO NOTHING"
 
+    # PREVIEW RUNS THE REAL STATEMENT AND ROLLS IT BACK, rather than
+    # rewriting it into a COUNT. Which clauses are in play depends on the
+    # branch -- DISTINCT ON only for the senders and label filters, NOT EXISTS
+    # only when force is false, ON CONFLICT DO NOTHING always -- so a
+    # hand-built count would have to reproduce that branching and would drift
+    # from it on the next edit, reporting a number the real call does not
+    # produce. Executing and discarding is exact by construction.
+    #
+    # It consumes sequence values, which are not rolled back. Harmless: the
+    # queue's id is a surrogate and gaps mean nothing.
+    if is_preview(request.args):
+        with ConnectionContext() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, tuple(params))
+                count = cur.rowcount
+            conn.rollback()
+        # An operator reading "would enqueue N" needs to know no rows landed;
+        # the real path below logs the same shape with preview=False.
+        logger.info(
+            "triage_rerun",
+            preview=True,
+            count=count,
+            label=label,
+            senders=senders or None,
+            gmail_ids=len(gmail_ids) or None,
+            force=force,
+            priority=priority,
+        )
+        return jsonify(
+            {
+                "preview": True,
+                "message": f"Would enqueue {count} emails for triage rerun",
+                "gmail_ids": gmail_ids if gmail_ids else None,
+                "label": label,
+                "senders": senders if senders else None,
+                "days": days if not gmail_ids else None,
+                "force": force,
+                "priority": priority,
+                "count": count,
+            }
+        )
+
     count = postgres.execute_update(query, tuple(params))
+    logger.info(
+        "triage_rerun",
+        preview=False,
+        count=count,
+        label=label,
+        senders=senders or None,
+        gmail_ids=len(gmail_ids) or None,
+        force=force,
+        priority=priority,
+    )
 
     return jsonify(
         {
+            "preview": False,
             "message": f"Enqueued {count} emails for triage rerun",
             "gmail_ids": gmail_ids if gmail_ids else None,
             "label": label,

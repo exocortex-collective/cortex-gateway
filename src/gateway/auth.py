@@ -123,8 +123,8 @@ def _is_exempt(path: str) -> bool:
 # /sync/* and /backfill/* (they spend Gmail API quota), /oauth/* (credential
 # management, and /oauth/status returns a server filesystem path),
 # POST /queue/failed/retry-all (bulk) and DELETE /queue/failed/<id>
-# (destructive), and POST /triage/rerun (enqueues in bulk at a chosen
-# priority; the UI gets it back when a read-only preview mode exists).
+# (destructive). POST /triage/rerun is conditional rather than withheld --
+# see _ui_route_allowed.
 UI_ALLOWED_EXACT: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/health"),
@@ -176,11 +176,34 @@ def _token_matches(presented: str | None, expected: str) -> bool:
     )
 
 
-def _ui_route_allowed(method: str, path: str) -> bool:
-    """Whether the scoped UI token may call this method and path."""
+def _ui_route_allowed(method: str, path: str, args: Any) -> bool:
+    """Whether the scoped UI token may call this method and path.
+
+    POST /triage/rerun is the one conditional case. With ?preview=1 the route
+    runs its INSERT and rolls back, reporting a count and writing nothing, so
+    the UI may ask. Without preview the same path enqueues thousands of rows
+    at a chosen priority, so it stays with api_token.
+
+    This permission is only sound while blueprints/triage.py honours
+    ?preview=; the gate and the route share is_preview so they cannot
+    disagree about what one is.
+    """
     if (method, path) in UI_ALLOWED_EXACT:
         return True
+    if method == "POST" and path == "/triage/rerun":
+        return is_preview(args)
     return any(m == method and pat.match(path) for m, pat in UI_ALLOWED_PATTERNS)
+
+
+def is_preview(args: Any) -> bool:
+    """A truthy ?preview= value. "0" and "false" do not count.
+
+    Public because blueprints/triage.py imports it: the gate's notion of
+    "this is a preview" and the route's must be the same function, or the
+    allowlist permits one thing and the handler does another.
+    """
+    raw = (args.get("preview") or "").strip().lower()
+    return raw in ("1", "true", "yes")
 
 
 def _parse_subnets(raw: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
@@ -365,14 +388,11 @@ def init_auth(
         # else falls through to the normal gate.
         if request.method == "OPTIONS" and _allowed_origin():
             preflight = Response(status=204)
-            # DELETE and X-Updated-By are advertised although NO UI_ALLOWED
-            # route accepts them, and that is deliberate. A preflight grants
-            # nothing -- the gate decides, and a withheld route is 403 either
-            # way -- so narrowing this buys no security. What it costs is the
-            # legibility the 403 exists for: a method the preflight omits is
-            # blocked by the BROWSER, and the extension sees an opaque failed
-            # fetch with no status instead of "token not permitted for this
-            # route". Narrowed for one round and reverted; see PR #40.
+            # DELETE and X-Updated-By are advertised although no UI_ALLOWED
+            # route accepts them. A preflight is not a security control -- the
+            # gate decides, and a withheld route is 403 either way -- but a
+            # method omitted here is blocked by the BROWSER, so the extension
+            # sees an opaque failed fetch instead of the deliberate 403.
             preflight.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
             preflight.headers["Access-Control-Allow-Headers"] = (
                 "Authorization, Content-Type, X-Created-By, X-Updated-By"
@@ -404,7 +424,7 @@ def init_auth(
         # the UI, the second is a misconfigured credential, and a single 401
         # for both sends the user to re-enter a token that was fine.
         if _token_matches(presented, ui_token):
-            if _ui_route_allowed(request.method, path):
+            if _ui_route_allowed(request.method, path, request.args):
                 return None
             logger.warning(
                 "ui_token_route_denied",
@@ -456,4 +476,4 @@ def _presented_token(headers: Any) -> str:
     return direct.strip()
 
 
-__all__ = ["init_auth", "is_internal"]
+__all__ = ["init_auth", "is_internal", "is_preview"]
