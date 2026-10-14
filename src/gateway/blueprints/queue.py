@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from typing import Any
 
+import psycopg2
 from cortex_utils.logging import get_logger
 from cortex_utils.queue import DeadLetterManager
 from cortex_utils.queue import inspect as queue_inspect
@@ -111,12 +112,14 @@ def _bulk(
             except Exception as exc:
                 _rollback(conn, action, dead_id)
                 # The message is not logged: a psycopg2 error carries a DETAIL
-                # line holding the offending row's values.
+                # line holding the offending row's values. Anything else gets
+                # its traceback, so a programming error can be found.
                 logger.warning(
                     "queue_bulk_item_failed",
                     action=action,
                     dead_id=dead_id,
                     error_type=type(exc).__name__,
+                    **({} if isinstance(exc, psycopg2.Error) else {"exc_info": True}),
                 )
                 results.append({"id": dead_id, "ok": False, "why": "error, see gateway logs"})
     moved = [r["id"] for r in results if r["ok"]]

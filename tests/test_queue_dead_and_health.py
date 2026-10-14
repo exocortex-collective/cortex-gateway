@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import psycopg2.errors
 import pytest
 from cortex_utils.queue import DeadLetterManager
 from flask import Flask
@@ -419,15 +420,30 @@ class TestBulkActions:
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_a_raising_id_is_audited_without_its_error_message(self, mgr, log, conn, client):
         """A psycopg2 message carries a DETAIL line holding row values."""
-        mgr.return_value.retry_job.side_effect = RuntimeError("DETAIL: Key (x)=(secret)")
+        mgr.return_value.retry_job.side_effect = psycopg2.errors.UniqueViolation(
+            "DETAIL: Key (x)=(secret)"
+        )
         client.post("/queue/dead/resubmit", json={"ids": [7]})
         warnings = {c.args[0]: c.kwargs for c in log.warning.call_args_list}
         assert warnings["queue_bulk_item_failed"] == {
             "action": "resubmit",
             "dead_id": 7,
-            "error_type": "RuntimeError",
+            "error_type": "UniqueViolation",
         }
         assert not any("secret" in str(v) for v in warnings["queue_bulk_item_failed"].values())
+
+    @patch("gateway.blueprints.queue.logger")
+    @patch("gateway.blueprints.queue.DeadLetterManager")
+    def test_a_non_database_error_is_logged_with_its_traceback(self, mgr, log, conn, client):
+        mgr.return_value.retry_job.side_effect = TypeError("API drift")
+        client.post("/queue/dead/resubmit", json={"ids": [7]})
+        warnings = {c.args[0]: c.kwargs for c in log.warning.call_args_list}
+        assert warnings["queue_bulk_item_failed"] == {
+            "action": "resubmit",
+            "dead_id": 7,
+            "error_type": "TypeError",
+            "exc_info": True,
+        }
 
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")
