@@ -529,6 +529,12 @@ class TestBulkActions:
             if c.args[0] == "queue_bulk_rollback_failed"
         ]
         assert rollbacks == [{"action": "resubmit", "dead_id": 7, "error_type": "RuntimeError"}]
+        lost = [
+            c.kwargs
+            for c in log.warning.call_args_list
+            if c.args[0] == "queue_bulk_connection_lost"
+        ]
+        assert lost == [{"action": "resubmit", "skipped": [8, 9]}]
         audit = {c.args[0]: c.kwargs for c in log.info.call_args_list}["queue_bulk_action"]
         assert audit["moved"] == []
         assert audit["failed"] == [7, 8, 9]

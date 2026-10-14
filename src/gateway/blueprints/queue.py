@@ -151,6 +151,7 @@ def _bulk(
                 if not usable:
                     # Not attempted: every later call would fail the same way.
                     rest = ids[position + 1 :]
+                    logger.warning("queue_bulk_connection_lost", action=action, skipped=rest)
                     results += [{"id": i, "ok": False, "why": "connection lost"} for i in rest]
                     break
     moved = [r["id"] for r in results if r["ok"]]
