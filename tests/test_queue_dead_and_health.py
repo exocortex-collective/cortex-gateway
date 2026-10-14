@@ -1,9 +1,4 @@
-"""Dead letters, stuck jobs and health, which were invisible over HTTP.
-
-This is where cortex loses mail quietly. A job that exhausts its attempts is
-archived to `dead_letter` and nothing surfaced it: cortex-b6hd found 1,614
-messages carrying no Cortex label, and `action_executed` on a classification
-only ever meant "a labeling job was enqueued", never "a label was applied".
+"""Dead letters, stuck jobs and health over HTTP.
 
 The routes are thin shaping over cortex_utils.queue, which is the SAME library
 cryo's daemon wraps for its own queue views -- so these are mocked at the
@@ -278,11 +273,7 @@ class TestResponseShapes:
 
 
 class TestPageLimits:
-    """Both bounds. Only the upper one was clamped, and only it was tested.
-
-    ?limit=0 and ?limit=-1 reached Postgres as LIMIT 0 / LIMIT -1, the second
-    of which it rejects -- a 500 from a query string.
-    """
+    """Both bounds: LIMIT 0 returns nothing and Postgres rejects LIMIT -1."""
 
     LIMITS = [("0", 1), ("-1", 1), ("7", 7), ("500", 100)]
 
@@ -362,14 +353,7 @@ class TestBulkActions:
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_a_committed_retry_is_never_reported_as_a_failure(self, mgr, log, conn, client):
-        """retry_job commits, so the id has moved whatever happens next.
-
-        Reading back the new queue id is a convenience. Letting it decide `ok`
-        reports a durable re-enqueue as failed, drops it from the audit line's
-        `moved`, and invites the operator to retry an id that has already
-        gone -- which why_not_retryable then refuses, so the UI shows a
-        failure for work that succeeded.
-        """
+        """retry_job commits, so the id has moved whatever happens next."""
         m = mgr.return_value
         m.retry_job.return_value = True
         m.get_job.side_effect = RuntimeError("readback blew up")
@@ -428,8 +412,7 @@ class TestBulkActions:
         assert fields["requested"] == [7, 8]
         assert fields["moved"] == [7], "only the ids that actually moved"
         assert fields["failed"] == [8]
-        # The exact value: truthiness passed with request.host substituted,
-        # which is a different fact about the request entirely.
+        # The exact value, not truthiness: request.host would also be truthy.
         assert fields["remote_addr"] == "127.0.0.1"
 
     @patch("gateway.blueprints.queue.logger")
@@ -463,8 +446,7 @@ class TestBulkActions:
         r = client.post("/queue/dead/resubmit", json={"ids": [7, 8, 9]})
         assert r.status_code == 200
         results = r.get_json()["results"]
-        # Every requested id, not just the first: with one id a break that
-        # dropped the rest was invisible.
+        # Every requested id, not just the first.
         assert [x["id"] for x in results] == [7, 8, 9]
         assert all(x["ok"] is False for x in results)
         rollbacks = [
@@ -479,12 +461,7 @@ class TestBulkActions:
 
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_one_raising_id_does_not_discard_the_others(self, mgr, conn, client):
-        """The route promises per-item results, so one bad id must cost one id.
-
-        In a single transaction a raise discarded every result and rolled back
-        the ids that had already succeeded, turning a partial success into a
-        500 with no information.
-        """
+        """The route promises per-item results, so one bad id must cost one id."""
         m = mgr.return_value
         m.retry_job.side_effect = [True, RuntimeError("boom"), True]
         m.get_job.return_value = {"retried_as": 1}
@@ -495,19 +472,13 @@ class TestBulkActions:
         assert [x["ok"] for x in data["results"]] == [True, False, True]
         assert data["resubmitted"] == 2
         # Exactly once, not merely "called": a rollback after every success
-        # would also satisfy `.called`, and would discard nothing visible here
-        # because the manager commits for itself.
+        # would also satisfy `.called`.
         assert conn.rollback.call_count == 1, "once, for the failed id only"
 
     @patch("gateway.blueprints.queue.logger")
     @patch("gateway.blueprints.queue.DeadLetterManager")
     def test_a_repeated_id_is_acted_on_once(self, mgr, log, conn, client):
-        """Otherwise the same id lands in both `moved` and `failed`.
-
-        The second attempt is refused by retried_at, so an audit line for
-        ids [5, 5] claimed three outcomes for two requested ids and reported
-        id 5 as having both moved and failed.
-        """
+        """One outcome per id, so the audit line cannot double-count."""
         m = mgr.return_value
         m.retry_job.return_value = True
         m.get_job.return_value = {"retried_as": 1}

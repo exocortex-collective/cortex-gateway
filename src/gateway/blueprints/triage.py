@@ -129,9 +129,14 @@ def rerun_triage():
             FROM emails_raw er
             WHERE er.gmail_id IN ({placeholders})
         """
-        # list[Any], not list[str | int]: a list is INVARIANT, so the later
-        # branches assigning list[int] and list[object] are rejected against
-        # the narrower annotation.
+        # list[Any], not list[str | int]: a list is INVARIANT, so the
+        # narrower annotation rejects both this assignment (list[int]) and
+        # the senders branch below (list[object]).
+        #
+        # Only the pre-commit mypy pin (1.5.1) rejects them; the newer mypy
+        # in this venv accepts the narrower type, so `uv run mypy` alone
+        # shows nothing and makes this look like dead weight. Narrowing it
+        # blocks every commit.
         params: list[Any] = [priority] + gmail_ids
     elif senders:
         # Sender filter with date range - join with emails_parsed to filter by from_addr

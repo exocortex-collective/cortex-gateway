@@ -7,6 +7,7 @@ from cortex_utils.logging import get_logger
 from cortex_utils.queue import DeadLetterManager
 from cortex_utils.queue import inspect as queue_inspect
 from flask import Blueprint, Response, jsonify, request
+from psycopg2.extensions import connection
 
 from gateway.services import postgres
 from gateway.services.postgres import ConnectionContext
@@ -50,9 +51,8 @@ def _requested_ids() -> tuple[list[int] | None, str | None]:
     """The `ids` list from a bulk body, or (None, error message)."""
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
-        # get_json(silent=True) returns whatever JSON was sent, so a bare list
-        # or string reached .get() and raised, turning a client mistake into a
-        # 500 with a traceback in the log.
+        # get_json(silent=True) returns whatever JSON was sent, so a bare
+        # list or string would otherwise reach .get() and raise.
         return None, "body must be a JSON object with an 'ids' list"
     raw = body.get("ids")
     if not isinstance(raw, list) or not raw:
@@ -63,18 +63,16 @@ def _requested_ids() -> tuple[list[int] | None, str | None]:
         # isinstance(True, int) is True, and `ids: [true]` would otherwise
         # become dead-letter id 1 -- an unrelated payload resurrected.
         return None, "ids must all be integers"
-    # Deduplicated, order kept: a repeated id is acted on once and then
-    # refused by retried_at, so it would land in both `moved` and `failed`
-    # and make the audit line's counts disagree with what was requested.
+    # Deduplicated, order kept, so the audit line reports one outcome per id.
     return list(dict.fromkeys(raw)), None
 
 
-def _rollback(conn: Any, action: str, dead_id: int) -> None:
+def _rollback(conn: connection, action: str, dead_id: int) -> None:
     """Clear an aborted transaction so the ids behind this one still run.
 
-    After an error psycopg2 refuses every later statement on the transaction,
-    so without this one bad id fails all the ids behind it. Any caller that
-    swallows a database error owes the batch this call.
+    After an error the server refuses every later statement on the
+    transaction, so without this one bad id fails all the ids behind it. Any
+    caller that swallows a database error owes the batch this call.
 
     Guarded because a rollback on an already-closed connection raises, and
     that exception would escape past ConnectionContext.__exit__ -- which
@@ -175,9 +173,8 @@ def queue_health() -> Response:
 def dead_letters() -> Response:
     """Jobs that exhausted their attempts.
 
-    Invisible over HTTP until now, which is where cortex loses mail quietly:
-    a truncated LLM response is retried to max_attempts and archived here,
-    and nothing surfaced it.
+    This is where cortex loses mail quietly: a truncated LLM response is
+    retried to max_attempts and archived here.
     """
     limit = _page_limit()
     include_resolved = request.args.get("include_resolved", "").lower() in (
