@@ -447,29 +447,35 @@ class TestBulkActions:
             try:
                 raise psycopg2.errors.UniqueViolation("DETAIL: Key (x)=(secret)")
             except psycopg2.Error as db:
-                if how == "cause":
-                    raise RuntimeError("wrapped") from db
+                caught = db
                 if how == "context":
                     raise RuntimeError("wrapped")
                 if how == "mixed":
                     # cause is not a database error; the database error is
                     # only the implicit context.
                     raise RuntimeError("wrapped") from ValueError("other")
-                if how == "group":
-                    caught = db
-                else:
+                if how == "two_hops":
                     try:
                         raise RuntimeError("inner") from db
                     except RuntimeError as inner:
                         raise TypeError("outer") from inner
-            # Raised outside the handler, so the group has no __context__
-            # and the database error is reachable only through .exceptions.
+            # Raised outside the handler, so there is no __context__ and the
+            # database error is reachable only through the link under test.
+            if how == "cause":
+                wrapper = RuntimeError("wrapped")
+                wrapper.__cause__ = caught
+                raise wrapper
             raise ExceptionGroup("g", [caught])
 
         mgr.return_value.retry_job.side_effect = raising
         client.post("/queue/dead/resubmit", json={"ids": [7]})
         warnings = {c.args[0]: c.kwargs for c in log.warning.call_args_list}
         assert "exc_info" not in warnings["queue_bulk_item_failed"]
+
+    def test_an_unrelated_exceptions_attribute_is_ignored(self):
+        exc = RuntimeError("x")
+        exc.exceptions = 5  # type: ignore[attr-defined]
+        assert _from_database(exc) is False
 
     def test_a_cyclic_exception_chain_terminates(self):
         a, b = RuntimeError("a"), RuntimeError("b")

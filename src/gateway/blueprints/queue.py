@@ -107,7 +107,9 @@ def _from_database(exc: BaseException | None) -> bool:
         if isinstance(cur, psycopg2.Error):
             return True
         seen.add(id(cur))
-        todo += [cur.__cause__, cur.__context__, *getattr(cur, "exceptions", ())]
+        todo += [cur.__cause__, cur.__context__]
+        if isinstance(cur, BaseExceptionGroup):
+            todo += cur.exceptions
     return False
 
 
