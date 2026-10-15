@@ -81,8 +81,8 @@ def list_versions() -> Response | tuple[Response, int]:
             -- activation always creates a new version (see activate_version).
             CASE
                 WHEN is_active THEN 'active'
-                WHEN version > (
-                    SELECT version FROM triage_config_versions WHERE is_active
+                WHEN version > COALESCE(
+                    (SELECT version FROM triage_config_versions WHERE is_active), 0
                 ) THEN 'staged'
                 ELSE 'superseded'
             END AS status,
@@ -333,6 +333,7 @@ def rollback_to_version(version: int) -> Response | tuple[Response, int]:
 
     Returns:
         201: Rollback successful, new version created
+        200: The version's content is already active; nothing changed
         404: Version not found
         400: Missing required headers
         500: Rollback failed
@@ -355,6 +356,7 @@ def activate_version(version: int) -> Response | tuple[Response, int]:
 
     Returns:
         201: Activated as a new version
+        200: The version's content is already active; nothing changed
         404: Version not found
         409: Version is already active
         400: Missing required headers

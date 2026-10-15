@@ -61,12 +61,12 @@ def conn(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
         cur.execute("SET search_path = t_gw_stage, public")
         cur.execute(SCHEMA)
     c.autocommit = False
-    import_yaml_to_db(c, _config("Live"), "seed")
     monkeypatch.setattr(pg, "get_connection", lambda: c)
     # The real pool rolls back an open transaction on putconn, so anything a
     # route did not commit is gone before the test looks.
     monkeypatch.setattr(pg, "put_connection", lambda c_: c_.rollback())
     try:
+        import_yaml_to_db(c, _config("Live"), "seed")
         yield c
     finally:
         c.rollback()
@@ -152,9 +152,21 @@ def test_activate_must_be_true_or_false(client: FlaskClient) -> None:
 
 
 def test_a_plain_put_still_activates_and_signals(client: FlaskClient, conn: Any) -> None:
-    r = client.put("/config", data=_config("Next"), headers=HEADERS, content_type="text/plain")
+    r = client.put(
+        "/config",
+        data=_config("Next"),
+        headers={**HEADERS, "X-Notes": "why"},
+        content_type="text/plain",
+    )
     assert r.status_code == 201
     version = r.get_json()["version"]
+    assert r.get_json() == {
+        "message": "Config created successfully",
+        "version": version,
+        "active": True,
+        "created_by": "test",
+        "notes": "why",
+    }
     assert _statuses(client)[version] == "active"
     assert _signalled(conn) == [version]
 
@@ -239,3 +251,47 @@ def test_rollback_reimports_and_records_where_from(client: FlaskClient, conn: An
         )
         assert cur.fetchone() == (1, "Rollback to version 1")
     assert "label: Live" in client.get("/config").get_data(as_text=True)
+
+
+@pytest.mark.parametrize("route", ["/config/activate/2", "/config/rollback/1"])
+def test_x_notes_overrides_the_default(client: FlaskClient, conn: Any, route: str) -> None:
+    _stage(client, "Next")
+    if route.endswith("/1"):
+        client.post("/config/activate/2", headers=HEADERS)
+    r = client.post(route, headers={**HEADERS, "X-Notes": "because"})
+    assert r.status_code == 201, r.get_json()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT notes FROM triage_config_versions WHERE version = %s",
+            (r.get_json()["new_version"],),
+        )
+        assert cur.fetchone()[0] == "because"
+
+
+def test_rollback_to_a_missing_version_is_404(client: FlaskClient) -> None:
+    assert client.post("/config/rollback/99", headers=HEADERS).status_code == 404
+
+
+def test_a_stored_config_that_no_longer_validates_is_reported(
+    client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stage(client, "Next")
+
+    def invalid(*_a: Any, **_k: Any) -> int:
+        raise ValueError("no longer valid")
+
+    monkeypatch.setattr(config_module, "import_yaml_to_db", invalid)
+    r = client.post("/config/activate/2", headers=HEADERS)
+    assert r.status_code == 500
+    assert r.get_json() == {
+        "error": "Failed to import config from version 2 as it is no longer valid."
+    }
+
+
+def test_with_no_active_version_a_stored_one_lists_as_staged(
+    client: FlaskClient, conn: Any
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute("UPDATE triage_config_versions SET is_active = FALSE")
+    conn.commit()
+    assert _statuses(client) == {1: "staged"}
