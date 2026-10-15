@@ -60,7 +60,9 @@ def conn(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     c.autocommit = False
     import_yaml_to_db(c, _config("Live"), "seed")
     monkeypatch.setattr(pg, "get_connection", lambda: c)
-    monkeypatch.setattr(pg, "put_connection", lambda _c: None)
+    # The real pool rolls back an open transaction on putconn, so anything a
+    # route did not commit is gone before the test looks.
+    monkeypatch.setattr(pg, "put_connection", lambda c_: c_.rollback())
     try:
         yield c
     finally:
@@ -114,6 +116,7 @@ def test_activating_a_staged_version_creates_and_signals_a_new_one(
     assert r.status_code == 201, r.get_json()
     new = r.get_json()["new_version"]
     assert new > staged
+    assert r.get_json()["message"] == f"Activated version {staged}"
     assert _statuses(client) == {1: "superseded", staged: "superseded", new: "active"}
     assert _signalled(conn) == [new]
     exported = client.get("/config").get_data(as_text=True)
@@ -141,3 +144,41 @@ def test_a_plain_put_still_activates_and_signals(client: FlaskClient, conn: Any)
     version = r.get_json()["version"]
     assert _statuses(client)[version] == "active"
     assert _signalled(conn) == [version]
+
+
+def test_staging_the_active_content_stages_nothing(client: FlaskClient, conn: Any) -> None:
+    r = client.put(
+        "/config?activate=false", data=_config("Live"), headers=HEADERS, content_type="text/plain"
+    )
+    assert r.status_code == 200
+    assert r.get_json() == {
+        "message": "Identical to the active version 1; nothing staged",
+        "version": 1,
+        "active": True,
+    }
+    assert _statuses(client) == {1: "active"}
+
+
+@pytest.mark.parametrize("route", ["/config/activate/1", "/config/rollback/1"])
+def test_reimport_routes_require_created_by(client: FlaskClient, route: str) -> None:
+    _stage(client, "Next")
+    client.post("/config/activate/2", headers=HEADERS)
+    assert client.post(route).status_code == 400
+
+
+def test_rollback_reimports_and_records_where_from(client: FlaskClient, conn: Any) -> None:
+    staged = _stage(client, "Next")
+    active = client.post(f"/config/activate/{staged}", headers=HEADERS).get_json()["new_version"]
+    r = client.post("/config/rollback/1", headers=HEADERS)
+    assert r.status_code == 201
+    body = r.get_json()
+    assert body["message"] == "Rolled back to version 1" and body["rolled_back_from"] == 1
+    new = body["new_version"]
+    assert new > active and _statuses(client)[new] == "active"
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT rolled_back_from, notes FROM triage_config_versions WHERE version = %s",
+            (new,),
+        )
+        assert cur.fetchone() == (1, "Rollback to version 1")
+    assert "label: Live" in client.get("/config").get_data(as_text=True)

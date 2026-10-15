@@ -68,7 +68,7 @@ jobs:
         run: uv run pytest
 
       - name: Fail if the live-Postgres tests were skipped
-        run: uv run pytest tests/test_config_staging_live.py -q -p no:skipping
+        run: uv run pytest tests/*_live.py -q -p no:skipping
 
   build:
     runs-on: ubuntu-latest

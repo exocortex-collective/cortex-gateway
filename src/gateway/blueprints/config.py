@@ -193,12 +193,30 @@ def update_config() -> Response | tuple[Response, int]:
                     )
                 conn.commit()
 
+        # Report what is stored, not what was asked for: staging content that
+        # is already active stores nothing and returns the live version.
+        row = execute_one(
+            "SELECT is_active FROM triage_config_versions WHERE version = %s", (version,)
+        )
+        active = bool(row and row["is_active"])
+        if not activate and active:
+            return (
+                jsonify(
+                    {
+                        "message": f"Identical to the active version {version}; nothing staged",
+                        "version": version,
+                        "active": True,
+                    }
+                ),
+                200,
+            )
+
         return (
             jsonify(
                 {
                     "message": "Config created successfully" if activate else "Config staged",
                     "version": version,
-                    "active": activate,
+                    "active": active,
                     "created_by": created_by,
                     "notes": notes,
                 }
@@ -309,12 +327,12 @@ def rollback_to_version(version: int) -> Response | tuple[Response, int]:
         400: Missing required headers
         500: Rollback failed
     """
-    return _reimport_as_active(version, "Rollback to", "Rolled back to")
+    return _reimport_as_active(version, "Rollback to version", "Rolled back to version", "Rollback")
 
 
 @config_bp.route("/activate/<int:version>", methods=["POST"])
 def activate_version(version: int) -> Response | tuple[Response, int]:
-    """Activate a staged config version (PUT /config?activate=false).
+    """Activate a stored config version: one staged with PUT /config?activate=false.
 
     Re-imports it as a NEW active version, exactly as rollback does, rather
     than flipping is_active: convergence re-triages mail whose
@@ -337,11 +355,13 @@ def activate_version(version: int) -> Response | tuple[Response, int]:
         return jsonify({"error": f"Version {version} not found"}), 404
     if row["is_active"]:
         return jsonify({"error": f"Version {version} is already active"}), 409
-    return _reimport_as_active(version, "Activate staged version", "Activated version")
+    return _reimport_as_active(
+        version, "Activate staged version", "Activated version", "Activation"
+    )
 
 
 def _reimport_as_active(
-    version: int, notes_prefix: str, message_prefix: str
+    version: int, notes_prefix: str, message_prefix: str, operation: str
 ) -> Response | tuple[Response, int]:
     """Copy a stored version into a new active version and signal a reload."""
     created_by = request.headers.get("X-Created-By")
@@ -365,7 +385,7 @@ def _reimport_as_active(
             except ValueError as e:
                 conn.rollback()
                 logger.error(
-                    "Rollback failed: config from version is invalid",
+                    f"{operation} failed: config from version is invalid",
                     version=version,
                     created_by=created_by,
                     notes=notes,
@@ -417,14 +437,14 @@ def _reimport_as_active(
 
     except Exception as e:
         logger.error(
-            "Rollback failed",
+            f"{operation} failed",
             error=str(e),
             version=version,
             created_by=created_by,
             notes=notes,
             exc_info=True,
         )
-        return jsonify({"error": "Rollback failed"}), 500
+        return jsonify({"error": f"{operation} failed"}), 500
 
 
 @config_bp.route("/diff/<int:v1>/<int:v2>", methods=["GET"])
