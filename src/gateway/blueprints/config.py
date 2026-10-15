@@ -9,6 +9,7 @@ from cortex_utils.triage_config import (
     load_rules_from_string,
     validate_rules,
 )
+from cortex_utils.triage_config.models import RulesConfig
 from flask import Blueprint, Response, jsonify, request
 from psycopg2.extras import Json
 from yaml import YAMLError
@@ -182,6 +183,19 @@ def update_config() -> Response | tuple[Response, int]:
         if errors:
             return jsonify({"error": "Validation failed", "errors": errors}), 400
 
+        # Mappings are global and unversioned: staging never writes them and
+        # activation re-exports the live ones, so a staged edit would vanish.
+        if not activate and _mapping_set(config) != _live_mapping_set():
+            return (
+                jsonify(
+                    {
+                        "error": "Email mapping changes cannot be staged; "
+                        "change them through /mappings"
+                    }
+                ),
+                400,
+            )
+
         # If validation passes, import to database
         with ConnectionContext() as conn:
             with conn.cursor() as cursor:
@@ -255,6 +269,34 @@ def update_config() -> Response | tuple[Response, int]:
             exc_info=True,
         )
         return jsonify({"error": "Import failed"}), 500
+
+
+def _mapping_set(config: RulesConfig) -> set[tuple[str, str, str, bool, bool]]:
+    return {
+        (kind, email.lower(), action.label, bool(action.archive), bool(action.mark_read))
+        for kind, mappings in (
+            ("priority", config.priority_email_mappings),
+            ("fallback", config.fallback_email_mappings),
+        )
+        for email, action in mappings.items()
+    }
+
+
+def _live_mapping_set() -> set[tuple[str, str, str, bool, bool]]:
+    rows = execute_query(
+        "SELECT mapping_type, email_address, label, archive, mark_read"
+        " FROM triage_email_mappings WHERE deleted_at IS NULL"
+    )
+    return {
+        (
+            r["mapping_type"],
+            r["email_address"].lower(),
+            r["label"],
+            bool(r["archive"]),
+            bool(r["mark_read"]),
+        )
+        for r in rows
+    }
 
 
 @config_bp.route("/validate", methods=["POST"])

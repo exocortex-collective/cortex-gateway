@@ -47,7 +47,7 @@ chains:
       - match: {{from_contains: example.com}}
         action: {{label: {label}}}
 priority_email_mappings:
-  vip@example.com: {{label: {label}}}
+  vip@example.com: {{label: VIP}}
 """
 
 
@@ -112,7 +112,7 @@ def test_staging_stores_an_inactive_version_and_signals_nothing(
     assert _signalled(conn) == []
     with conn.cursor() as cur:
         cur.execute("SELECT label FROM triage_email_mappings")
-        assert cur.fetchall() == [("Live",)]
+        assert cur.fetchall() == [("VIP",)]
 
 
 def test_activating_a_staged_version_creates_and_signals_a_new_one(
@@ -124,6 +124,7 @@ def test_activating_a_staged_version_creates_and_signals_a_new_one(
     new = r.get_json()["new_version"]
     assert new > staged
     assert r.get_json()["message"] == f"Activated version {staged}"
+    assert r.get_json()["created_by"] == "test"
     assert _statuses(client) == {1: "superseded", staged: "superseded", new: "active"}
     assert _signalled(conn) == [new]
     with conn.cursor() as cur:
@@ -167,6 +168,11 @@ def test_a_plain_put_still_activates_and_signals(client: FlaskClient, conn: Any)
         "created_by": "test",
         "notes": "why",
     }
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT created_by, notes FROM triage_config_versions WHERE version = %s", (version,)
+        )
+        assert cur.fetchone() == ("test", "why")
     assert _statuses(client)[version] == "active"
     assert _signalled(conn) == [version]
 
@@ -295,3 +301,34 @@ def test_with_no_active_version_a_stored_one_lists_as_staged(
         cur.execute("UPDATE triage_config_versions SET is_active = FALSE")
     conn.commit()
     assert _statuses(client) == {1: "staged"}
+
+
+def test_staging_an_edited_export_round_trips_the_mappings(client: FlaskClient) -> None:
+    exported = client.get("/config").get_data(as_text=True)
+    edited = exported.replace("label: Live", "label: Edited", 1)
+    r = client.put(
+        "/config?activate=false", data=edited, headers=HEADERS, content_type="text/plain"
+    )
+    assert r.status_code == 201, r.get_json()
+
+
+def test_mapping_changes_cannot_be_staged(client: FlaskClient) -> None:
+    changed = _config("Live").replace("{label: VIP}", "{label: X}")
+    r = client.put(
+        "/config?activate=false", data=changed, headers=HEADERS, content_type="text/plain"
+    )
+    assert r.status_code == 400
+    assert "/mappings" in r.get_json()["error"]
+    assert _statuses(client) == {1: "active"}
+
+
+def test_with_no_active_version_restaging_and_activating_work(
+    client: FlaskClient, conn: Any
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute("UPDATE triage_config_versions SET is_active = FALSE")
+    conn.commit()
+    assert _restage(client, "Live")["status"] == "staged"
+    r = client.post("/config/activate/1", headers=HEADERS)
+    assert r.status_code == 201, r.get_json()
+    assert _statuses(client)[r.get_json()["new_version"]] == "active"
