@@ -20,6 +20,7 @@ from cortex_utils.triage_config import import_yaml_to_db
 from flask import Flask
 from flask.testing import FlaskClient
 
+import gateway.blueprints.config as config_module
 import gateway.services.postgres as pg
 from gateway.blueprints.config import config_bp
 
@@ -45,6 +46,8 @@ chains:
     rules:
       - match: {{from_contains: example.com}}
         action: {{label: {label}}}
+priority_email_mappings:
+  vip@example.com: {{label: {label}}}
 """
 
 
@@ -96,6 +99,7 @@ def _stage(client: FlaskClient, label: str) -> int:
         "/config?activate=false", data=_config(label), headers=HEADERS, content_type="text/plain"
     )
     assert r.status_code == 201, r.get_json()
+    assert r.get_json()["message"] == "Config staged"
     assert r.get_json()["active"] is False
     return int(r.get_json()["version"])
 
@@ -106,6 +110,9 @@ def test_staging_stores_an_inactive_version_and_signals_nothing(
     staged = _stage(client, "Next")
     assert _statuses(client) == {1: "active", staged: "staged"}
     assert _signalled(conn) == []
+    with conn.cursor() as cur:
+        cur.execute("SELECT label FROM triage_email_mappings")
+        assert cur.fetchall() == [("Live",)]
 
 
 def test_activating_a_staged_version_creates_and_signals_a_new_one(
@@ -119,6 +126,12 @@ def test_activating_a_staged_version_creates_and_signals_a_new_one(
     assert r.get_json()["message"] == f"Activated version {staged}"
     assert _statuses(client) == {1: "superseded", staged: "superseded", new: "active"}
     assert _signalled(conn) == [new]
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT rolled_back_from, notes FROM triage_config_versions WHERE version = %s",
+            (new,),
+        )
+        assert cur.fetchone() == (staged, f"Activate staged version {staged}")
     exported = client.get("/config").get_data(as_text=True)
     assert "label: Next" in exported
 
@@ -146,17 +159,61 @@ def test_a_plain_put_still_activates_and_signals(client: FlaskClient, conn: Any)
     assert _signalled(conn) == [version]
 
 
-def test_staging_the_active_content_stages_nothing(client: FlaskClient, conn: Any) -> None:
+def _restage(client: FlaskClient, label: str) -> Any:
     r = client.put(
-        "/config?activate=false", data=_config("Live"), headers=HEADERS, content_type="text/plain"
+        "/config?activate=false", data=_config(label), headers=HEADERS, content_type="text/plain"
     )
-    assert r.status_code == 200
-    assert r.get_json() == {
-        "message": "Identical to the active version 1; nothing staged",
+    assert r.status_code == 200, r.get_json()
+    return r.get_json()
+
+
+def test_restaging_stored_content_stages_nothing_and_says_what_matched(
+    client: FlaskClient,
+) -> None:
+    assert _restage(client, "Live") == {
+        "message": "Identical to active version 1; nothing staged",
         "version": 1,
-        "active": True,
+        "status": "active",
     }
-    assert _statuses(client) == {1: "active"}
+    staged = _stage(client, "Next")
+    assert _restage(client, "Next")["status"] == "staged"
+    client.post(f"/config/activate/{staged}", headers=HEADERS)
+    old = _stage(client, "Old")
+    client.put("/config", data=_config("Newer"), headers=HEADERS, content_type="text/plain")
+    assert _restage(client, "Old") == {
+        "message": f"Identical to superseded version {old}; nothing staged",
+        "version": old,
+        "status": "superseded",
+    }
+
+
+def test_activating_content_that_is_already_live_changes_nothing(
+    client: FlaskClient, conn: Any
+) -> None:
+    staged = _stage(client, "Next")
+    live = client.post(f"/config/activate/{staged}", headers=HEADERS).get_json()["new_version"]
+    r = client.post(f"/config/activate/{staged}", headers=HEADERS)
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()["active_version"] == live
+    assert _signalled(conn) == [live]
+
+
+@pytest.mark.parametrize(
+    ("route", "operation"),
+    [("/config/activate/2", "Activation"), ("/config/rollback/1", "Rollback")],
+)
+def test_a_failed_reimport_names_its_operation(
+    client: FlaskClient, monkeypatch: pytest.MonkeyPatch, route: str, operation: str
+) -> None:
+    _stage(client, "Next")
+
+    def boom(*_a: Any, **_k: Any) -> int:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(config_module, "import_yaml_to_db", boom)
+    r = client.post(route, headers=HEADERS)
+    assert r.status_code == 500
+    assert r.get_json() == {"error": f"{operation} failed"}
 
 
 @pytest.mark.parametrize("route", ["/config/activate/1", "/config/rollback/1"])

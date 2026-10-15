@@ -153,7 +153,9 @@ def update_config() -> Response | tuple[Response, int]:
 
     Returns:
         201: New version created
-        400: Invalid YAML or validation errors
+        200: Staging only: the content matches a stored version, so nothing
+            was stored; the reply names that version and its status
+        400: Invalid YAML, validation errors, or activate not true/false
         500: Import failed
     """
     # Get YAML content from request body
@@ -182,30 +184,38 @@ def update_config() -> Response | tuple[Response, int]:
 
         # If validation passes, import to database
         with ConnectionContext() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT COALESCE(MAX(version), 0) FROM triage_config_versions")
+                latest_before = cursor.fetchone()[0]
             version = import_yaml_to_db(conn, yaml_content, created_by, notes, activate=activate)
-            if activate:
-                with conn.cursor() as cursor:
+            with conn.cursor() as cursor:
+                if activate:
                     cursor.execute(
                         "INSERT INTO worker_signals"
                         " (signal_type, target_worker, payload)"
                         " VALUES ('config_reload', 'all', %s)",
                         (Json({"version": version}),),
                     )
-                conn.commit()
+                cursor.execute("SELECT version FROM triage_config_versions WHERE is_active")
+                row = cursor.fetchone()
+            conn.commit()
+        active_version = row[0] if row else None
 
-        # Report what is stored, not what was asked for: staging content that
-        # is already active stores nothing and returns the live version.
-        row = execute_one(
-            "SELECT is_active FROM triage_config_versions WHERE version = %s", (version,)
-        )
-        active = bool(row and row["is_active"])
-        if not activate and active:
+        # Staging content that is already stored stores nothing: say which
+        # version it matched rather than claiming a new staged version.
+        if not activate and version <= latest_before:
+            if version == active_version:
+                status = "active"
+            elif active_version is None or version > active_version:
+                status = "staged"
+            else:
+                status = "superseded"
             return (
                 jsonify(
                     {
-                        "message": f"Identical to the active version {version}; nothing staged",
+                        "message": f"Identical to {status} version {version}; nothing staged",
                         "version": version,
-                        "active": True,
+                        "status": status,
                     }
                 ),
                 200,
@@ -216,7 +226,7 @@ def update_config() -> Response | tuple[Response, int]:
                 {
                     "message": "Config created successfully" if activate else "Config staged",
                     "version": version,
-                    "active": active,
+                    "active": version == active_version,
                     "created_by": created_by,
                     "notes": notes,
                 }
@@ -379,6 +389,10 @@ def _reimport_as_active(
                 logger.error("Version not found", version=version, error=str(e), exc_info=True)
                 return jsonify({"error": f"Version {version} not found"}), 404
 
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT version FROM triage_config_versions WHERE is_active")
+                active_row = cursor.fetchone()
+
             # Import as new version with rollback marker
             try:
                 new_version = import_yaml_to_db(conn, yaml_content, created_by, notes)
@@ -402,6 +416,23 @@ def _reimport_as_active(
                         }
                     ),
                     500,
+                )
+
+            # Content identical to the live config resolves to the active
+            # version: nothing changed, so no marker and no reload.
+            if active_row and new_version == active_row[0]:
+                conn.commit()
+                return (
+                    jsonify(
+                        {
+                            "message": (
+                                f"Version {version} matches the active version"
+                                f" {new_version}; nothing changed"
+                            ),
+                            "active_version": new_version,
+                        }
+                    ),
+                    200,
                 )
 
             # Mark as rollback in database and send reload signal
