@@ -9,11 +9,12 @@ from cortex_utils.triage_config import (
     load_rules_from_string,
     validate_rules,
 )
+from cortex_utils.triage_config.models import RulesConfig
 from flask import Blueprint, Response, jsonify, request
 from psycopg2.extras import Json
 from yaml import YAMLError
 
-from gateway.services.postgres import ConnectionContext, execute_query
+from gateway.services.postgres import ConnectionContext, execute_one, execute_query
 
 logger = get_logger()
 
@@ -77,6 +78,15 @@ def list_versions() -> Response | tuple[Response, int]:
             notes,
             is_active,
             rolled_back_from,
+            -- A version newer than the active one has never been activated:
+            -- activation always creates a new version (see activate_version).
+            CASE
+                WHEN is_active THEN 'active'
+                WHEN version > COALESCE(
+                    (SELECT version FROM triage_config_versions WHERE is_active), 0
+                ) THEN 'staged'
+                ELSE 'superseded'
+            END AS status,
             COUNT(*) OVER() as total
         FROM triage_config_versions
         ORDER BY version DESC
@@ -137,9 +147,17 @@ def update_config() -> Response | tuple[Response, int]:
         X-Created-By: Username/email creating the config (required)
         X-Notes: Optional description of changes
 
+    Query params:
+        activate: "false" stages the version: stored inactive, no worker
+            reload, email mappings untouched. Activate it later with
+            POST /config/activate/<version>. Default "true".
+
     Returns:
         201: New version created
-        400: Invalid YAML or validation errors
+        200: Staging only: the content matches a stored version, so nothing
+            was stored; the reply names that version and its status
+        400: Invalid YAML, validation errors, activate not true/false, or a
+            staged config whose email mappings differ from the live ones
         500: Import failed
     """
     # Get YAML content from request body
@@ -154,6 +172,11 @@ def update_config() -> Response | tuple[Response, int]:
 
     notes = request.headers.get("X-Notes")
 
+    activate_arg = request.args.get("activate", "true").lower()
+    if activate_arg not in ("true", "false"):
+        return jsonify({"error": "activate must be true or false"}), 400
+    activate = activate_arg == "true"
+
     try:
         # Validate before opening DB connection
         config = load_rules_from_string(yaml_content)
@@ -161,23 +184,64 @@ def update_config() -> Response | tuple[Response, int]:
         if errors:
             return jsonify({"error": "Validation failed", "errors": errors}), 400
 
+        # Mappings are global and unversioned: staging never writes them and
+        # activation re-exports the live ones, so a staged edit would vanish.
+        if not activate and _mapping_set(config) != _live_mapping_set():
+            return (
+                jsonify(
+                    {
+                        "error": "Email mapping changes cannot be staged; "
+                        "change them through /mappings"
+                    }
+                ),
+                400,
+            )
+
         # If validation passes, import to database
         with ConnectionContext() as conn:
-            version = import_yaml_to_db(conn, yaml_content, created_by, notes)
             with conn.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO worker_signals"
-                    " (signal_type, target_worker, payload)"
-                    " VALUES ('config_reload', 'all', %s)",
-                    (Json({"version": version}),),
-                )
+                cursor.execute("SELECT COALESCE(MAX(version), 0) FROM triage_config_versions")
+                latest_before = cursor.fetchone()[0]
+            version = import_yaml_to_db(conn, yaml_content, created_by, notes, activate=activate)
+            with conn.cursor() as cursor:
+                if activate:
+                    cursor.execute(
+                        "INSERT INTO worker_signals"
+                        " (signal_type, target_worker, payload)"
+                        " VALUES ('config_reload', 'all', %s)",
+                        (Json({"version": version}),),
+                    )
+                cursor.execute("SELECT version FROM triage_config_versions WHERE is_active")
+                row = cursor.fetchone()
             conn.commit()
+        active_version = row[0] if row else None
+
+        # Staging content that is already stored stores nothing: say which
+        # version it matched rather than claiming a new staged version.
+        if not activate and version <= latest_before:
+            if version == active_version:
+                status = "active"
+            elif active_version is None or version > active_version:
+                status = "staged"
+            else:
+                status = "superseded"
+            return (
+                jsonify(
+                    {
+                        "message": f"Identical to {status} version {version}; nothing staged",
+                        "version": version,
+                        "status": status,
+                    }
+                ),
+                200,
+            )
 
         return (
             jsonify(
                 {
-                    "message": "Config created successfully",
+                    "message": "Config created successfully" if activate else "Config staged",
                     "version": version,
+                    "active": version == active_version,
                     "created_by": created_by,
                     "notes": notes,
                 }
@@ -206,6 +270,34 @@ def update_config() -> Response | tuple[Response, int]:
             exc_info=True,
         )
         return jsonify({"error": "Import failed"}), 500
+
+
+def _mapping_set(config: RulesConfig) -> set[tuple[str, str, str, bool, bool]]:
+    return {
+        (kind, email, action.label, bool(action.archive), bool(action.mark_read))
+        for kind, mappings in (
+            ("priority", config.priority_email_mappings),
+            ("fallback", config.fallback_email_mappings),
+        )
+        for email, action in mappings.items()
+    }
+
+
+def _live_mapping_set() -> set[tuple[str, str, str, bool, bool]]:
+    rows = execute_query(
+        "SELECT mapping_type, email_address, label, archive, mark_read"
+        " FROM triage_email_mappings WHERE deleted_at IS NULL"
+    )
+    return {
+        (
+            r["mapping_type"],
+            r["email_address"],
+            r["label"],
+            bool(r["archive"]),
+            bool(r["mark_read"]),
+        )
+        for r in rows
+    }
 
 
 @config_bp.route("/validate", methods=["POST"])
@@ -284,15 +376,54 @@ def rollback_to_version(version: int) -> Response | tuple[Response, int]:
 
     Returns:
         201: Rollback successful, new version created
+        200: The version's content is already active; nothing changed
         404: Version not found
         400: Missing required headers
         500: Rollback failed
     """
+    return _reimport_as_active(version, "Rollback to version", "Rolled back to version", "Rollback")
+
+
+@config_bp.route("/activate/<int:version>", methods=["POST"])
+def activate_version(version: int) -> Response | tuple[Response, int]:
+    """Activate a stored config version: one staged with PUT /config?activate=false.
+
+    Re-imports it as a NEW active version, exactly as rollback does, rather
+    than flipping is_active: convergence re-triages mail whose
+    config_version_id is below the active version, so an older number made
+    active would leave mail classified under newer versions unconverged.
+
+    Request headers:
+        X-Created-By: Username/email activating (required)
+        X-Notes: Optional description
+
+    Returns:
+        201: Activated as a new version
+        200: The version's content is already active; nothing changed
+        404: Version not found
+        409: Version is already active
+        400: Missing required headers
+        500: Activation failed
+    """
+    row = execute_one("SELECT is_active FROM triage_config_versions WHERE version = %s", (version,))
+    if row is None:
+        return jsonify({"error": f"Version {version} not found"}), 404
+    if row["is_active"]:
+        return jsonify({"error": f"Version {version} is already active"}), 409
+    return _reimport_as_active(
+        version, "Activate staged version", "Activated version", "Activation"
+    )
+
+
+def _reimport_as_active(
+    version: int, notes_prefix: str, message_prefix: str, operation: str
+) -> Response | tuple[Response, int]:
+    """Copy a stored version into a new active version and signal a reload."""
     created_by = request.headers.get("X-Created-By")
     if not created_by:
         return jsonify({"error": "Missing X-Created-By header"}), 400
 
-    notes = request.headers.get("X-Notes") or f"Rollback to version {version}"
+    notes = request.headers.get("X-Notes") or f"{notes_prefix} {version}"
 
     try:
         with ConnectionContext() as conn:
@@ -303,13 +434,17 @@ def rollback_to_version(version: int) -> Response | tuple[Response, int]:
                 logger.error("Version not found", version=version, error=str(e), exc_info=True)
                 return jsonify({"error": f"Version {version} not found"}), 404
 
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT version FROM triage_config_versions WHERE is_active")
+                active_row = cursor.fetchone()
+
             # Import as new version with rollback marker
             try:
                 new_version = import_yaml_to_db(conn, yaml_content, created_by, notes)
             except ValueError as e:
                 conn.rollback()
                 logger.error(
-                    "Rollback failed: config from version is invalid",
+                    f"{operation} failed: config from version is invalid",
                     version=version,
                     created_by=created_by,
                     notes=notes,
@@ -326,6 +461,23 @@ def rollback_to_version(version: int) -> Response | tuple[Response, int]:
                         }
                     ),
                     500,
+                )
+
+            # Content identical to the live config resolves to the active
+            # version: nothing changed, so no marker and no reload.
+            if active_row and new_version == active_row[0]:
+                conn.commit()
+                return (
+                    jsonify(
+                        {
+                            "message": (
+                                f"Version {version} matches the active version"
+                                f" {new_version}; nothing changed"
+                            ),
+                            "active_version": new_version,
+                        }
+                    ),
+                    200,
                 )
 
             # Mark as rollback in database and send reload signal
@@ -349,7 +501,7 @@ def rollback_to_version(version: int) -> Response | tuple[Response, int]:
         return (
             jsonify(
                 {
-                    "message": f"Rolled back to version {version}",
+                    "message": f"{message_prefix} {version}",
                     "new_version": new_version,
                     "rolled_back_from": version,
                     "created_by": created_by,
@@ -361,14 +513,14 @@ def rollback_to_version(version: int) -> Response | tuple[Response, int]:
 
     except Exception as e:
         logger.error(
-            "Rollback failed",
+            f"{operation} failed",
             error=str(e),
             version=version,
             created_by=created_by,
             notes=notes,
             exc_info=True,
         )
-        return jsonify({"error": "Rollback failed"}), 500
+        return jsonify({"error": f"{operation} failed"}), 500
 
 
 @config_bp.route("/diff/<int:v1>/<int:v2>", methods=["GET"])
