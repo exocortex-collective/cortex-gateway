@@ -37,6 +37,21 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # For the *_live.py tests: config versioning lives in triggers a mock cannot run.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      CORTEX_TEST_DSN: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres"
     steps:
       - uses: actions/checkout@v6
 
@@ -51,6 +66,9 @@ jobs:
 
       - name: Run tests
         run: uv run pytest
+
+      - name: Fail if the live-Postgres tests were skipped
+        run: uv run pytest tests/test_config_staging_live.py -q -p no:skipping
 
   build:
     runs-on: ubuntu-latest

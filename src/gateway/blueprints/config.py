@@ -13,7 +13,7 @@ from flask import Blueprint, Response, jsonify, request
 from psycopg2.extras import Json
 from yaml import YAMLError
 
-from gateway.services.postgres import ConnectionContext, execute_query
+from gateway.services.postgres import ConnectionContext, execute_one, execute_query
 
 logger = get_logger()
 
@@ -77,6 +77,15 @@ def list_versions() -> Response | tuple[Response, int]:
             notes,
             is_active,
             rolled_back_from,
+            -- A version newer than the active one has never been activated:
+            -- activation always creates a new version (see activate_version).
+            CASE
+                WHEN is_active THEN 'active'
+                WHEN version > (
+                    SELECT version FROM triage_config_versions WHERE is_active
+                ) THEN 'staged'
+                ELSE 'superseded'
+            END AS status,
             COUNT(*) OVER() as total
         FROM triage_config_versions
         ORDER BY version DESC
@@ -137,6 +146,11 @@ def update_config() -> Response | tuple[Response, int]:
         X-Created-By: Username/email creating the config (required)
         X-Notes: Optional description of changes
 
+    Query params:
+        activate: "false" stages the version: stored inactive, no worker
+            reload, email mappings untouched. Activate it later with
+            POST /config/activate/<version>. Default "true".
+
     Returns:
         201: New version created
         400: Invalid YAML or validation errors
@@ -154,6 +168,11 @@ def update_config() -> Response | tuple[Response, int]:
 
     notes = request.headers.get("X-Notes")
 
+    activate_arg = request.args.get("activate", "true").lower()
+    if activate_arg not in ("true", "false"):
+        return jsonify({"error": "activate must be true or false"}), 400
+    activate = activate_arg == "true"
+
     try:
         # Validate before opening DB connection
         config = load_rules_from_string(yaml_content)
@@ -163,21 +182,23 @@ def update_config() -> Response | tuple[Response, int]:
 
         # If validation passes, import to database
         with ConnectionContext() as conn:
-            version = import_yaml_to_db(conn, yaml_content, created_by, notes)
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO worker_signals"
-                    " (signal_type, target_worker, payload)"
-                    " VALUES ('config_reload', 'all', %s)",
-                    (Json({"version": version}),),
-                )
-            conn.commit()
+            version = import_yaml_to_db(conn, yaml_content, created_by, notes, activate=activate)
+            if activate:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "INSERT INTO worker_signals"
+                        " (signal_type, target_worker, payload)"
+                        " VALUES ('config_reload', 'all', %s)",
+                        (Json({"version": version}),),
+                    )
+                conn.commit()
 
         return (
             jsonify(
                 {
-                    "message": "Config created successfully",
+                    "message": "Config created successfully" if activate else "Config staged",
                     "version": version,
+                    "active": activate,
                     "created_by": created_by,
                     "notes": notes,
                 }
@@ -288,11 +309,46 @@ def rollback_to_version(version: int) -> Response | tuple[Response, int]:
         400: Missing required headers
         500: Rollback failed
     """
+    return _reimport_as_active(version, "Rollback to", "Rolled back to")
+
+
+@config_bp.route("/activate/<int:version>", methods=["POST"])
+def activate_version(version: int) -> Response | tuple[Response, int]:
+    """Activate a staged config version (PUT /config?activate=false).
+
+    Re-imports it as a NEW active version, exactly as rollback does, rather
+    than flipping is_active: convergence re-triages mail whose
+    config_version_id is below the active version, so an older number made
+    active would leave mail classified under newer versions unconverged.
+
+    Request headers:
+        X-Created-By: Username/email activating (required)
+        X-Notes: Optional description
+
+    Returns:
+        201: Activated as a new version
+        404: Version not found
+        409: Version is already active
+        400: Missing required headers
+        500: Activation failed
+    """
+    row = execute_one("SELECT is_active FROM triage_config_versions WHERE version = %s", (version,))
+    if row is None:
+        return jsonify({"error": f"Version {version} not found"}), 404
+    if row["is_active"]:
+        return jsonify({"error": f"Version {version} is already active"}), 409
+    return _reimport_as_active(version, "Activate staged version", "Activated version")
+
+
+def _reimport_as_active(
+    version: int, notes_prefix: str, message_prefix: str
+) -> Response | tuple[Response, int]:
+    """Copy a stored version into a new active version and signal a reload."""
     created_by = request.headers.get("X-Created-By")
     if not created_by:
         return jsonify({"error": "Missing X-Created-By header"}), 400
 
-    notes = request.headers.get("X-Notes") or f"Rollback to version {version}"
+    notes = request.headers.get("X-Notes") or f"{notes_prefix} {version}"
 
     try:
         with ConnectionContext() as conn:
@@ -349,7 +405,7 @@ def rollback_to_version(version: int) -> Response | tuple[Response, int]:
         return (
             jsonify(
                 {
-                    "message": f"Rolled back to version {version}",
+                    "message": f"{message_prefix} {version}",
                     "new_version": new_version,
                     "rolled_back_from": version,
                     "created_by": created_by,
