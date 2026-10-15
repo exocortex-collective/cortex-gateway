@@ -48,6 +48,8 @@ chains:
         action: {{label: {label}}}
 priority_email_mappings:
   vip@example.com: {{label: VIP}}
+fallback_email_mappings:
+  news@example.com: {{label: News}}
 """
 
 
@@ -112,7 +114,7 @@ def test_staging_stores_an_inactive_version_and_signals_nothing(
     assert _signalled(conn) == []
     with conn.cursor() as cur:
         cur.execute("SELECT label FROM triage_email_mappings")
-        assert cur.fetchall() == [("VIP",)]
+        assert sorted(cur.fetchall()) == [("News",), ("VIP",)]
 
 
 def test_activating_a_staged_version_creates_and_signals_a_new_one(
@@ -332,3 +334,54 @@ def test_with_no_active_version_restaging_and_activating_work(
     r = client.post("/config/activate/1", headers=HEADERS)
     assert r.status_code == 201, r.get_json()
     assert _statuses(client)[r.get_json()["new_version"]] == "active"
+
+
+VIP = "vip@example.com: {label: VIP}"
+NEWS = "news@example.com: {label: News}"
+FALLBACK = "\nfallback_email_mappings:\n  "
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (VIP, "vip@example.com: {label: Other}"),
+        (NEWS, "news@example.com: {label: Other}"),
+        (VIP, "vip@example.com: {label: VIP, archive: true}"),
+        (VIP, "vip@example.com: {label: VIP, mark_read: true}"),
+        (NEWS, NEWS + "\n  x@example.com: {label: X}"),
+        (VIP + FALLBACK + NEWS, NEWS + FALLBACK + VIP),
+    ],
+    ids=["priority-label", "fallback-label", "archive", "mark-read", "added", "kind-moved"],
+)
+def test_the_mapping_guard_sees_each_kind_of_difference(
+    client: FlaskClient, old: str, new: str
+) -> None:
+    changed = _config("Live").replace(old, new)
+    assert changed != _config("Live")
+    r = client.put(
+        "/config?activate=false", data=changed, headers=HEADERS, content_type="text/plain"
+    )
+    assert r.status_code == 400, r.get_json()
+
+
+def test_the_mapping_guard_ignores_case_and_soft_deleted_rows(
+    client: FlaskClient, conn: Any
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO triage_email_mappings"
+            " (mapping_type, email_address, label, created_at, updated_at, deleted_at)"
+            " VALUES ('priority', 'gone@example.com', 'Gone', now(), now(), now())"
+        )
+    conn.commit()
+    staged = _config("Next").replace("vip@example.com", "VIP@Example.com")
+    r = client.put(
+        "/config?activate=false", data=staged, headers=HEADERS, content_type="text/plain"
+    )
+    assert r.status_code == 201, r.get_json()
+
+
+def test_a_plain_put_may_change_mappings(client: FlaskClient) -> None:
+    changed = _config("Next").replace("{label: VIP}", "{label: Other}")
+    r = client.put("/config", data=changed, headers=HEADERS, content_type="text/plain")
+    assert r.status_code == 201, r.get_json()

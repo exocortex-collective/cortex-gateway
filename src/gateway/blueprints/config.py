@@ -156,7 +156,8 @@ def update_config() -> Response | tuple[Response, int]:
         201: New version created
         200: Staging only: the content matches a stored version, so nothing
             was stored; the reply names that version and its status
-        400: Invalid YAML, validation errors, or activate not true/false
+        400: Invalid YAML, validation errors, activate not true/false, or a
+            staged config whose email mappings differ from the live ones
         500: Import failed
     """
     # Get YAML content from request body
@@ -273,7 +274,7 @@ def update_config() -> Response | tuple[Response, int]:
 
 def _mapping_set(config: RulesConfig) -> set[tuple[str, str, str, bool, bool]]:
     return {
-        (kind, email.lower(), action.label, bool(action.archive), bool(action.mark_read))
+        (kind, email, action.label, bool(action.archive), bool(action.mark_read))
         for kind, mappings in (
             ("priority", config.priority_email_mappings),
             ("fallback", config.fallback_email_mappings),
@@ -290,7 +291,7 @@ def _live_mapping_set() -> set[tuple[str, str, str, bool, bool]]:
     return {
         (
             r["mapping_type"],
-            r["email_address"].lower(),
+            r["email_address"],
             r["label"],
             bool(r["archive"]),
             bool(r["mark_read"]),
