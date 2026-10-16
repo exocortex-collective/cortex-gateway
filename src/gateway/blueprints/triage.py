@@ -385,3 +385,123 @@ def convergence_status():
             "oldest_version": oldest_version,
         }
     )
+
+
+# Answering a trash_sender question (cortex-gco6). The triage labeling worker
+# owns these tables and opens the questions; an answer records Devon's decision
+# and re-enqueues the mail it releases, which the labeling worker then trashes.
+TRASH_ANSWERS = {
+    "sender": ("approved", "approved"),  # sender decision, pending rows become
+    "once": (None, "approved"),
+    "ignore": ("rejected", "kept"),
+}
+
+
+@triage_bp.route("/questions")
+def list_questions():
+    """Open questions, largest first. Only kind trash_sender exists so far."""
+    status = request.args.get("status", "open")
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+        offset = int(request.args.get("offset", 0))
+    except ValueError:
+        return jsonify({"error": "limit and offset must be integers"}), 400
+    rows = postgres.execute_query(
+        """
+        SELECT q.id, q.kind, q.status, q.asked_at, q.from_addr,
+               COUNT(t.gmail_id) AS volume,
+               COALESCE(json_agg(json_build_object(
+                   'gmail_id', t.gmail_id, 'subject', p.subject,
+                   'date_header', p.date_header)
+                 ORDER BY t.queued_at DESC) FILTER (WHERE t.gmail_id IS NOT NULL),
+                 '[]') AS sample,
+               COUNT(*) OVER () AS total
+        FROM triage_questions q
+        LEFT JOIN triage_trash_queue t
+          ON t.from_addr = q.from_addr AND t.status = 'pending'
+        LEFT JOIN emails_parsed p ON p.gmail_id = t.gmail_id
+        WHERE q.status = %s
+        GROUP BY q.id
+        ORDER BY volume DESC, q.asked_at
+        LIMIT %s OFFSET %s
+        """,
+        (status, limit, offset),
+    )
+    questions = [
+        {
+            "id": r["id"],
+            "kind": r["kind"],
+            "status": r["status"],
+            "asked_at": r["asked_at"].isoformat(),
+            "from_addr": r["from_addr"],
+            "volume": r["volume"],
+            "sample": r["sample"][:5],
+            "proposed": None,
+            "llm_category": None,
+            "confidence": None,
+            "reasoning": None,
+        }
+        for r in rows
+    ]
+    total = rows[0]["total"] if rows else 0
+    return jsonify({"questions": questions, "limit": limit, "offset": offset, "total": total})
+
+
+@triage_bp.route("/questions/<question_id>/answer", methods=["POST"])
+def answer_question(question_id: str) -> Any:
+    """Answer a trash_sender question: scope sender, once or ignore."""
+    created_by = request.headers.get("X-Created-By")
+    if not created_by:
+        return jsonify({"error": "Missing X-Created-By header"}), 400
+    scope = (request.get_json(silent=True) or {}).get("scope")
+    if scope not in TRASH_ANSWERS:
+        return jsonify({"error": f"scope must be one of {sorted(TRASH_ANSWERS)}"}), 400
+    decision, row_status = TRASH_ANSWERS[scope]
+
+    with ConnectionContext() as conn, conn.cursor() as cur:
+        # The labeling worker's trash gate takes the same lock, so this decision
+        # never lands between its read and its write.
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext('triage_trash_gate'))")
+        cur.execute(
+            "SELECT kind, from_addr FROM triage_questions"
+            " WHERE id = %s AND status = 'open' FOR UPDATE",
+            (question_id,),
+        )
+        row = cur.fetchone()
+        if row is None or row[0] != "trash_sender":
+            conn.rollback()
+            return jsonify({"error": "no open trash_sender question with that id"}), 404
+        from_addr = row[1]
+        if decision:
+            cur.execute(
+                """
+                INSERT INTO triage_trash_senders (email_address, decision, decided_by)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (email_address) DO UPDATE
+                   SET decision = EXCLUDED.decision, decided_by = EXCLUDED.decided_by,
+                       decided_at = now()
+                """,
+                (from_addr, decision, created_by),
+            )
+        cur.execute(
+            "UPDATE triage_trash_queue SET status = %s, updated_at = now()"
+            " WHERE from_addr = %s AND status = 'pending' RETURNING gmail_id",
+            (row_status, from_addr),
+        )
+        released = [r[0] for r in cur.fetchall()] if row_status == "approved" else []
+        if released:
+            cur.execute(
+                "INSERT INTO queue (queue_name, payload, status, priority)"
+                " SELECT 'labeling', jsonb_build_object('gmail_id', g), 'pending', 0"
+                " FROM unnest(%s::text[]) AS g",
+                (released,),
+            )
+        cur.execute(
+            "UPDATE triage_questions SET status = 'answered', answered_at = now(),"
+            " answer = jsonb_build_object('scope', %s::text, 'by', %s::text)"
+            " WHERE id = %s",
+            (scope, created_by, question_id),
+        )
+        conn.commit()
+    logger.info(f"Trash question {question_id} ({from_addr}) answered {scope}")
+    return jsonify({"answered": question_id, "scope": scope, "rows_enqueued": len(released)})
