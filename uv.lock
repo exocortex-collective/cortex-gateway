@@ -205,7 +205,7 @@ dev = [
 requires-dist = [
     { name = "black", marker = "extra == 'dev'", specifier = ">=24.0.0" },
     { name = "click", specifier = ">=8.0.0" },
-    { name = "cortex-utils", git = "https://github.com/devonjones/cortex-utils.git?rev=17c6366" },
+    { name = "cortex-utils", git = "https://github.com/devonjones/cortex-utils.git?rev=e48500f" },
     { name = "flask", specifier = ">=3.0.0" },
     { name = "google-auth", specifier = ">=2.0.0" },
     { name = "google-auth-oauthlib", specifier = ">=1.0.0" },
@@ -226,7 +226,7 @@ provides-extras = ["dev"]
 [[package]]
 name = "cortex-utils"
 version = "0.1.0"
-source = { git = "https://github.com/devonjones/cortex-utils.git?rev=17c6366#17c63662208e7b563b1ce0fd8986ec6a5a1c57b2" }
+source = { git = "https://github.com/devonjones/cortex-utils.git?rev=e48500f#e48500f5cdf30a385581a60b43cbf1604737ed8c" }
 dependencies = [
     { name = "click" },
     { name = "docker" },

@@ -10,7 +10,7 @@ dependencies = [
     "httpx>=0.27.0",
     "click>=8.0.0",
     "structlog>=24.0.0",
-    "cortex-utils @ git+https://github.com/devonjones/cortex-utils.git@17c6366",
+    "cortex-utils @ git+https://github.com/devonjones/cortex-utils.git@e48500f",
     "google-auth>=2.0.0",
     "google-auth-oauthlib>=1.0.0",
 ]
