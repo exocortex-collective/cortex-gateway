@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -29,19 +30,23 @@ pytestmark = pytest.mark.skipif(
 
 SCHEMA = (Path(__file__).parent / "fixtures" / "trash_schema.sql").read_text()
 BY = {"X-Created-By": "test@trash"}
+SCHEMA_NAME = f"t_gw_trash_{uuid.uuid4().hex[:8]}"  # reviewers share one Postgres
 
 
 @pytest.fixture
 def conn(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
-    c = psycopg2.connect(DSN, options="-c search_path=t_gw_trash")
+    c = psycopg2.connect(DSN, options=f"-c search_path={SCHEMA_NAME}")
     c.autocommit = True
     with c.cursor() as cur:
-        cur.execute("DROP SCHEMA IF EXISTS t_gw_trash CASCADE")
-        cur.execute("CREATE SCHEMA t_gw_trash")
+        cur.execute(f"DROP SCHEMA IF EXISTS {SCHEMA_NAME} CASCADE")
+        cur.execute(f"CREATE SCHEMA {SCHEMA_NAME}")
         cur.execute(SCHEMA)
-        cur.execute("CREATE TABLE emails_parsed (gmail_id TEXT, subject TEXT, date_header TEXT)")
         cur.execute(
-            "INSERT INTO emails_parsed VALUES ('g1', 'Sale', 'Mon'), ('g2', 'Sale 2', 'Tue')"
+            "CREATE TABLE emails_parsed (gmail_id TEXT, subject TEXT, date_header TIMESTAMPTZ)"
+        )
+        cur.execute(
+            "INSERT INTO emails_parsed VALUES"
+            " ('g1', 'Sale', '2026-10-01'), ('g2', 'Sale 2', '2026-10-02')"
         )
         cur.execute(
             "INSERT INTO triage_trash_queue (gmail_id, from_addr, status) VALUES"
@@ -65,7 +70,7 @@ def conn(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
         c.rollback()
         c.autocommit = True
         with c.cursor() as cur:
-            cur.execute("DROP SCHEMA IF EXISTS t_gw_trash CASCADE")
+            cur.execute(f"DROP SCHEMA IF EXISTS {SCHEMA_NAME} CASCADE")
         c.close()
 
 
@@ -187,3 +192,70 @@ def test_an_answer_waits_for_a_gate_in_progress(client: FlaskClient) -> None:
         answer.join()
     finally:
         other.close()
+
+
+def _ask(conn: Any, qid: str, addr: str, held: int, kind: str = "trash_sender") -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO triage_questions (id, kind, from_addr) VALUES (%s, %s, %s)",
+            (qid, kind, addr),
+        )
+        for i in range(held):
+            cur.execute(
+                "INSERT INTO triage_trash_queue (gmail_id, from_addr, status)"
+                " VALUES (%s, %s, 'pending')",
+                (f"{qid}-{i}", addr),
+            )
+    conn.commit()
+
+
+def test_listing_pages_and_caps_the_sample(client: FlaskClient, conn: Any) -> None:
+    _ask(conn, "q-c", "c@x.com", 7)
+    body = client.get("/triage/questions?limit=1&offset=0").get_json()
+    assert [q["id"] for q in body["questions"]] == ["q-c"]
+    assert body["questions"][0]["volume"] == 7
+    assert len(body["questions"][0]["sample"]) == 5
+    assert body["total"] == 3
+    page2 = client.get("/triage/questions?limit=1&offset=1").get_json()
+    assert [q["id"] for q in page2["questions"]] == ["q-a"]
+    assert client.get("/triage/questions?limit=999").get_json()["limit"] == 200
+
+
+def test_listing_filters_by_status(client: FlaskClient) -> None:
+    client.post("/triage/questions/q-a/answer", json={"scope": "once"}, headers=BY)
+    answered = client.get("/triage/questions?status=answered").get_json()
+    assert [q["id"] for q in answered["questions"]] == ["q-a"]
+    assert [q["id"] for q in client.get("/triage/questions").get_json()["questions"]] == ["q-b"]
+
+
+@pytest.mark.parametrize("query", ["limit=x", "limit=-1", "offset=-1"])
+def test_a_bad_page_is_a_400(client: FlaskClient, query: str) -> None:
+    assert client.get(f"/triage/questions?{query}").status_code == 400
+
+
+def test_another_kind_of_question_is_not_answered_here(client: FlaskClient, conn: Any) -> None:
+    _ask(conn, "q-u", "u@x.com", 0, kind="uncategorized_sender")
+    r = client.post("/triage/questions/q-u/answer", json={"scope": "sender"}, headers=BY)
+    assert r.status_code == 404
+    assert _rows(conn, "SELECT status FROM triage_questions WHERE id = 'q-u'") == [("open",)]
+
+
+def test_a_sender_can_be_decided_again(client: FlaskClient, conn: Any) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO triage_trash_senders (email_address, decision, decided_by)"
+            " VALUES ('a@x.com', 'rejected', 'earlier')"
+        )
+    conn.commit()
+    client.post("/triage/questions/q-a/answer", json={"scope": "sender"}, headers=BY)
+    assert _rows(conn, "SELECT decision, decided_by FROM triage_trash_senders") == [
+        ("approved", "test@trash")
+    ]
+
+
+def test_released_mail_is_queued_like_live_mail(client: FlaskClient, conn: Any) -> None:
+    client.post("/triage/questions/q-a/answer", json={"scope": "sender"}, headers=BY)
+    assert _rows(conn, "SELECT status, priority FROM queue WHERE queue_name = 'labeling'") == [
+        ("pending", 0),
+        ("pending", 0),
+    ]

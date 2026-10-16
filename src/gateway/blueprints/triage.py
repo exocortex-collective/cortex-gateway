@@ -405,7 +405,9 @@ def list_questions():
         limit = min(int(request.args.get("limit", 50)), 200)
         offset = int(request.args.get("offset", 0))
     except ValueError:
-        return jsonify({"error": "limit and offset must be integers"}), 400
+        limit = offset = -1
+    if limit < 0 or offset < 0:
+        return jsonify({"error": "limit and offset must be integers >= 0"}), 400
     rows = postgres.execute_query(
         """
         SELECT q.id, q.kind, q.status, q.asked_at, q.from_addr,
