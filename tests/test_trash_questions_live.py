@@ -228,7 +228,9 @@ def test_listing_filters_by_status(client: FlaskClient) -> None:
     assert [q["id"] for q in client.get("/triage/questions").get_json()["questions"]] == ["q-b"]
 
 
-@pytest.mark.parametrize("query", ["limit=x", "limit=-1", "offset=-1"])
+@pytest.mark.parametrize(
+    "query", ["limit=x", "limit=-1", "offset=-1", "offset=99999999999999999999"]
+)
 def test_a_bad_page_is_a_400(client: FlaskClient, query: str) -> None:
     assert client.get(f"/triage/questions?{query}").status_code == 400
 
@@ -259,3 +261,31 @@ def test_released_mail_is_queued_like_live_mail(client: FlaskClient, conn: Any) 
         ("pending", 0),
         ("pending", 0),
     ]
+
+
+def test_a_question_has_the_contract_shape(client: FlaskClient, conn: Any) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE triage_trash_queue SET queued_at = now() - interval '1 day'"
+            " WHERE gmail_id = 'g1'"
+        )
+    conn.commit()
+    q = client.get("/triage/questions").get_json()["questions"][0]
+    assert [(s["gmail_id"], s["subject"]) for s in q["sample"]] == [
+        ("g2", "Sale 2"),
+        ("g1", "Sale"),
+    ]
+    assert q["sample"][0]["date_header"].startswith("2026-10-02")
+    assert q["asked_at"][:4].isdigit() and "T" in q["asked_at"]
+    assert [q[k] for k in ("proposed", "llm_category", "confidence", "reasoning")] == [None] * 4
+
+
+def test_equal_volume_asks_oldest_first(client: FlaskClient, conn: Any) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM triage_trash_queue")
+        cur.execute(
+            "UPDATE triage_questions SET asked_at = now() - interval '1 day' WHERE id = 'q-b'"
+        )
+    conn.commit()
+    ids = [q["id"] for q in client.get("/triage/questions").get_json()["questions"]]
+    assert ids == ["q-b", "q-a"]
