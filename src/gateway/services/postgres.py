@@ -2,10 +2,13 @@
 
 from typing import Any
 
+from cortex_utils.logging import get_logger
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 
 from gateway.config import config
+
+logger = get_logger()
 
 # Connection pool (initialized lazily)
 _pool: pool.ThreadedConnectionPool | None = None
@@ -47,9 +50,33 @@ class ConnectionContext:
         return self.conn
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Return the connection to the pool, whatever the rollback does.
+
+        The rollback is guarded because the thing that makes it raise is
+        usually the thing that raised in the body: a connection Postgres
+        closed under us fails the query and then fails to roll back
+        (InterfaceError). An escaping exception here skips put_connection,
+        and psycopg2 frees a pool slot only in putconn, so the slot is gone
+        for the life of the process -- ten of those exhaust maxconn and every
+        route that touches the database 500s until someone restarts the
+        container, which `restart: unless-stopped` will not do for a process
+        that is merely wedged.
+
+        Nothing is lost by deferring: putconn rolls a live in-transaction
+        connection back itself, closes one whose transaction status is
+        UNKNOWN, and discards one already closed.
+
+        It also stops the secondary exception REPLACING the original, which
+        reported `connection already closed` in place of the real failure.
+        """
         if self.conn:
             if exc_type is not None:
-                self.conn.rollback()
+                try:
+                    self.conn.rollback()
+                except Exception as exc:
+                    # error_type only: psycopg2 messages carry DETAIL lines
+                    # holding row values.
+                    logger.warning("rollback_failed", error_type=type(exc).__name__)
             put_connection(self.conn)
 
 
