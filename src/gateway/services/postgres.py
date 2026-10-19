@@ -50,24 +50,13 @@ class ConnectionContext:
         return self.conn
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Return the connection to the pool, whatever the rollback does.
+        """Return the connection to the pool even when the rollback fails.
 
-        The rollback is guarded because the thing that makes it raise is
-        usually the thing that raised in the body: a connection Postgres
-        closed under us fails the query and then fails to roll back
-        (InterfaceError). An escaping exception here skips put_connection,
-        and psycopg2 frees a pool slot only in putconn, so the slot is gone
-        for the life of the process -- ten of those exhaust maxconn and every
-        route that touches the database 500s until someone restarts the
-        container, which `restart: unless-stopped` will not do for a process
-        that is merely wedged.
-
-        Nothing is lost by deferring: putconn rolls a live in-transaction
-        connection back itself, closes one whose transaction status is
-        UNKNOWN, and discards one already closed.
-
-        It also stops the secondary exception REPLACING the original, which
-        reported `connection already closed` in place of the real failure.
+        What makes the rollback raise is usually what raised in the body: a
+        connection Postgres closed under us fails the query and then fails to
+        roll back. An exception here would skip put_connection, and psycopg2
+        frees the slot only in putconn -- which ends the transaction itself,
+        by rollback or by closing the connection, so nothing is lost.
         """
         if self.conn:
             if exc_type is not None:

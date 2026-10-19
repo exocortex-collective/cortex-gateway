@@ -77,8 +77,7 @@ def _rollback(conn: connection, action: str, dead_id: int) -> bool:
 
     Guarded because a rollback on an already-closed connection raises, and
     that exception would skip the audit line below even though ids had
-    already been applied. ConnectionContext.__exit__ guards its own rollback
-    too, so the pool slot is safe either way.
+    already been applied.
 
     Returns False when the rollback itself failed, meaning the connection is
     unusable.
