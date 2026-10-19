@@ -18,7 +18,7 @@ from gateway.blueprints import (
     triage_bp,
 )
 from gateway.config import config
-from gateway.services.postgres import get_connection, init_pool
+from gateway.services.postgres import ConnectionContext, init_pool
 
 logger = get_logger()
 
@@ -96,9 +96,9 @@ def create_app() -> Flask:
 def check_postgres() -> tuple[str, bool]:
     """Health check for Postgres connection."""
     try:
-        conn = get_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
+        with ConnectionContext() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
         return ("postgres", True)
     except Exception as e:
         logger.warning("postgres_health_check_failed", error_type=type(e).__name__)

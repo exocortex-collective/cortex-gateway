@@ -12,7 +12,7 @@ SECRET = "host=db.internal password=hunter2"
 
 def test_postgres_failure_logs_type_not_message():
     with (
-        patch.object(app_module, "get_connection", side_effect=RuntimeError(SECRET)),
+        patch.object(app_module, "ConnectionContext", side_effect=RuntimeError(SECRET)),
         structlog.testing.capture_logs() as logs,
     ):
         assert app_module.check_postgres() == ("postgres", False)

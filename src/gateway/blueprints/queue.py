@@ -76,10 +76,8 @@ def _rollback(conn: connection, action: str, dead_id: int) -> bool:
     caller that swallows a database error owes the batch this call.
 
     Guarded because a rollback on an already-closed connection raises, and
-    that exception would escape past ConnectionContext.__exit__ -- which
-    rolls back again, raises again, and never reaches put_connection, leaking
-    the pool slot and skipping the audit line even though ids had been
-    applied.
+    that exception would skip the audit line below even though ids had
+    already been applied.
 
     Returns False when the rollback itself failed, meaning the connection is
     unusable.
