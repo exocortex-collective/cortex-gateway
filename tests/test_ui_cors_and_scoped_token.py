@@ -45,8 +45,14 @@ PATTERN_SAMPLES = (
     (
         "POST",
         "/queue/failed/5/retry",
-        ("/queue/failed/5/retry/extra", "/queue/failed/abc/retry"),
+        ("/queue/failed/5/retry/extra", "/queue/failed/abc/retry", "/queue/failed//retry"),
         "GET",
+    ),
+    (
+        "DELETE",
+        "/queue/failed/5",
+        ("/queue/failed/5/extra", "/queue/failed/abc", "/queue/failed/"),
+        "POST",
     ),
     (
         "POST",
@@ -69,7 +75,6 @@ PATTERN_SAMPLES = (
 # Routes the app under test serves. The gate runs before dispatch, so the
 # handlers only need to exist for the allowed cases to come back 200.
 DENIED_ROUTES = (
-    ("/queue/failed/5", ("DELETE",)),
     ("/queue/failed/retry-all", ("POST",)),
     # Conditional, not denied: allowed only with a truthy ?preview=.
     ("/triage/rerun", ("POST",)),
@@ -299,11 +304,11 @@ class TestTheUiTokenIsScoped:
     ) -> None:
         """The preflight must advertise MORE than the allowlist permits.
 
-        No allowed route accepts DELETE, so it would be tempting to drop it
-        from Allow-Methods. That would make the browser block the request and
-        hand the extension an opaque failed fetch, replacing the 403 whose
-        whole purpose is telling "not permitted here" from "wrong credential".
-        The gate, not the preflight, is the boundary.
+        Allow-Methods is per method, not per route, so dropping DELETE would
+        block the one DELETE the allowlist permits AND cost every withheld
+        DELETE its legible 403 -- the browser blocks the request and the
+        extension sees an opaque failed fetch instead of "not permitted
+        here". The gate, not the preflight, is the boundary.
         """
         advertised = {
             v.strip()
@@ -311,7 +316,7 @@ class TestTheUiTokenIsScoped:
             .headers["Access-Control-Allow-Methods"]
             .split(",")
         }
-        denied = _ui(client, "DELETE", "/queue/failed/5")
+        denied = _ui(client, "DELETE", "/mappings/851")
         assert denied.status_code == 403
         assert denied.get_json()["error"] == "token not permitted for this route"
         assert "DELETE" in advertised, "or the browser masks that 403"
@@ -369,6 +374,7 @@ class TestTheUiTokenIsScoped:
         """
         assert tuple((m, pat.pattern) for m, pat in UI_ALLOWED_PATTERNS) == (
             ("POST", r"^/queue/failed/\d+/retry$"),
+            ("DELETE", r"^/queue/failed/\d+$"),
             ("POST", r"^/triage/questions/[A-Za-z0-9_-]+/answer$"),
             ("GET", r"^/config/diff/\d+/\d+$"),
             ("GET", r"^/mappings/history/.+$"),
@@ -386,7 +392,6 @@ class TestTheUiTokenIsScoped:
             ("DELETE", "/mappings/851", "removes a precedent"),
             ("PUT", "/mappings/851", "edits a precedent"),
             ("POST", "/queue/failed/retry-all", "bulk, unscoped by id"),
-            ("DELETE", "/queue/failed/5", "destructive"),
         ],
     )
     def test_everything_else_is_403_not_401(
@@ -534,7 +539,8 @@ class TestTheAllowlistItself:
     def test_pattern_routes_do_not_over_match(self) -> None:
         assert _ui_route_allowed("POST", "/queue/failed/5/retry", {})
         assert not _ui_route_allowed("POST", "/queue/failed/5/retry/extra", {})
-        assert not _ui_route_allowed("DELETE", "/queue/failed/5", {})
+        assert _ui_route_allowed("DELETE", "/queue/failed/5", {})
+        assert not _ui_route_allowed("DELETE", "/queue/failed/5/extra", {})
 
     def test_method_is_part_of_the_match(self) -> None:
         assert _ui_route_allowed("GET", "/mappings", {})
