@@ -131,7 +131,7 @@ def test_a_second_putconn_failure_propagates(monkeypatch) -> None:
 
 
 def test_the_putconn_failure_is_logged_without_the_message(monkeypatch) -> None:
-    """Same DETAIL-line risk as rollback_failed, and it was unasserted."""
+    """Same DETAIL-line risk as rollback_failed."""
     fake_pool = MagicMock()
     fake_pool.putconn.side_effect = [DEAD, None]
     monkeypatch.setattr(pg, "_pool", fake_pool)
