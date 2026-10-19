@@ -122,9 +122,8 @@ def _is_exempt(path: str) -> bool:
 # /mappings (a precedent should be added from the UI, not silently removed),
 # /sync/* and /backfill/* (they spend Gmail API quota), /oauth/* (credential
 # management, and /oauth/status returns a server filesystem path),
-# POST /queue/failed/retry-all (bulk) and DELETE /queue/failed/<id>
-# (destructive). POST /triage/rerun is conditional rather than withheld --
-# see _ui_route_allowed.
+# POST /queue/failed/retry-all (bulk, unscoped by id). POST /triage/rerun is
+# conditional rather than withheld -- see _ui_route_allowed.
 UI_ALLOWED_EXACT: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/health"),
@@ -149,6 +148,11 @@ UI_ALLOWED_EXACT: frozenset[tuple[str, str]] = frozenset(
 
 UI_ALLOWED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/queue/failed/\d+/retry$")),
+    # Destructive, and allowed anyway: the UI needs delete as an action
+    # (Devon, 2026-10-19). It names one id and delete_failed refuses a row
+    # whose status is not 'failed', so the blast radius is one dead letter.
+    # retry-all is the unscoped sibling and stays withheld.
+    ("DELETE", re.compile(r"^/queue/failed/\d+$")),
     ("POST", re.compile(r"^/triage/questions/[A-Za-z0-9_-]+/answer$")),
     ("GET", re.compile(r"^/config/diff/\d+/\d+$")),
     ("GET", re.compile(r"^/mappings/history/.+$")),
