@@ -34,9 +34,21 @@ def get_connection() -> Any:
 
 
 def put_connection(conn: Any) -> None:
-    """Return a connection to the pool."""
-    if _pool is not None:
+    """Return a connection to the pool, and free the slot whatever happens.
+
+    putconn rolls an in-transaction connection back ITSELF, unguarded, and
+    raises before the `del self._used[key]` that frees the slot -- so a
+    connection whose rollback fails strands its slot inside psycopg2, where
+    guarding the caller cannot reach it. close=True takes the branch that
+    skips the rollback, so the retry always frees the key.
+    """
+    if _pool is None:
+        return
+    try:
         _pool.putconn(conn)
+    except Exception as exc:
+        logger.warning("putconn_failed", error_type=type(exc).__name__)
+        _pool.putconn(conn, close=True)
 
 
 class ConnectionContext:
@@ -54,19 +66,19 @@ class ConnectionContext:
 
         What makes the rollback raise is usually what raised in the body: a
         connection Postgres closed under us fails the query and then fails to
-        roll back. An exception here would skip put_connection, and psycopg2
-        frees the slot only in putconn -- which ends the transaction itself,
-        by rollback or by closing the connection, so nothing is lost.
+        roll back. The release is in a finally so that neither that, nor a
+        BaseException, nor the logger itself can skip it.
         """
         if self.conn:
-            if exc_type is not None:
-                try:
+            try:
+                if exc_type is not None:
                     self.conn.rollback()
-                except Exception as exc:
-                    # error_type only: psycopg2 messages carry DETAIL lines
-                    # holding row values.
-                    logger.warning("rollback_failed", error_type=type(exc).__name__)
-            put_connection(self.conn)
+            except Exception as exc:
+                # error_type only: psycopg2 messages carry DETAIL lines
+                # holding row values.
+                logger.warning("rollback_failed", error_type=type(exc).__name__)
+            finally:
+                put_connection(self.conn)
 
 
 def execute_query(query: str, params: tuple[Any, ...] | None = None) -> list[dict[str, Any]]:
