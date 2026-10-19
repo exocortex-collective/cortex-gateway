@@ -15,14 +15,14 @@ from gateway.services.postgres import ConnectionContext, put_connection
 
 DEAD = psycopg2.InterfaceError("connection already closed")
 
-# minconn, transaction_status, closed. minconn matters because psycopg2 only
-# takes the branch that rolls back inside putconn while the idle pool is below
-# it -- production runs minconn=2, and a fixture at 0 cannot see that path.
+# minconn, transaction_status, closed. putconn only rolls back while the idle
+# pool is below minconn, so minconn selects the branch under test.
 POOL_STATES = [
     (0, extensions.TRANSACTION_STATUS_INTRANS, 0),
     (2, extensions.TRANSACTION_STATUS_INTRANS, 0),
     (2, extensions.TRANSACTION_STATUS_UNKNOWN, 0),
     (2, extensions.TRANSACTION_STATUS_INTRANS, 1),
+    (2, extensions.TRANSACTION_STATUS_IDLE, 0),
 ]
 
 
@@ -84,7 +84,7 @@ def test_the_health_check_does_not_consume_the_pool(real_pool) -> None:
 
 
 def test_a_raising_putconn_is_retried_with_close(monkeypatch) -> None:
-    """putconn's own rollback is unguarded and raises before it frees the key."""
+    """A putconn that raises is retried with close=True."""
     fake_pool = MagicMock()
     fake_pool.putconn.side_effect = [DEAD, None]
     monkeypatch.setattr(pg, "_pool", fake_pool)
@@ -112,6 +112,34 @@ def test_the_failure_is_logged_without_the_message(
                 raise ValueError("boom")
 
     mock_logger.warning.assert_called_once_with("rollback_failed", error_type="InterfaceError")
+
+
+def test_an_uninitialised_pool_is_a_no_op(monkeypatch) -> None:
+    monkeypatch.setattr(pg, "_pool", None)
+
+    put_connection(MagicMock())
+
+
+def test_a_second_putconn_failure_propagates(monkeypatch) -> None:
+    """The retry is unguarded on purpose: a genuine pool fault stays loud."""
+    fake_pool = MagicMock()
+    fake_pool.putconn.side_effect = [DEAD, pool.PoolError("trying to put unkeyed connection")]
+    monkeypatch.setattr(pg, "_pool", fake_pool)
+
+    with pytest.raises(pool.PoolError):
+        put_connection(MagicMock())
+
+
+def test_the_putconn_failure_is_logged_without_the_message(monkeypatch) -> None:
+    """Same DETAIL-line risk as rollback_failed, and it was unasserted."""
+    fake_pool = MagicMock()
+    fake_pool.putconn.side_effect = [DEAD, None]
+    monkeypatch.setattr(pg, "_pool", fake_pool)
+
+    with patch("gateway.services.postgres.logger") as mock_logger:
+        put_connection(MagicMock())
+
+    mock_logger.warning.assert_called_once_with("putconn_failed", error_type="InterfaceError")
 
 
 @patch("gateway.services.postgres.put_connection")

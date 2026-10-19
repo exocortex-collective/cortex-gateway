@@ -34,13 +34,10 @@ def get_connection() -> Any:
 
 
 def put_connection(conn: Any) -> None:
-    """Return a connection to the pool, and free the slot whatever happens.
+    """Return a connection to the pool, freeing the slot even if that fails.
 
-    putconn rolls an in-transaction connection back ITSELF, unguarded, and
-    raises before the `del self._used[key]` that frees the slot -- so a
-    connection whose rollback fails strands its slot inside psycopg2, where
-    guarding the caller cannot reach it. close=True takes the branch that
-    skips the rollback, so the retry always frees the key.
+    putconn's own rollback can raise before it frees the slot; close=True
+    skips that rollback.
     """
     if _pool is None:
         return
@@ -62,13 +59,7 @@ class ConnectionContext:
         return self.conn
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Return the connection to the pool even when the rollback fails.
-
-        What makes the rollback raise is usually what raised in the body: a
-        connection Postgres closed under us fails the query and then fails to
-        roll back. The release is in a finally so that neither that, nor a
-        BaseException, nor the logger itself can skip it.
-        """
+        """Always release the connection, even if the rollback raises."""
         if self.conn:
             try:
                 if exc_type is not None:
