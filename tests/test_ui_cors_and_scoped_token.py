@@ -45,13 +45,13 @@ PATTERN_SAMPLES = (
     (
         "POST",
         "/queue/failed/5/retry",
-        ("/queue/failed/5/retry/extra", "/queue/failed/abc/retry"),
+        ("/queue/failed/5/retry/extra", "/queue/failed/abc/retry", "/queue/failed//retry"),
         "GET",
     ),
     (
         "DELETE",
         "/queue/failed/5",
-        ("/queue/failed/5/extra", "/queue/failed/abc"),
+        ("/queue/failed/5/extra", "/queue/failed/abc", "/queue/failed/"),
         "POST",
     ),
     (
@@ -304,11 +304,11 @@ class TestTheUiTokenIsScoped:
     ) -> None:
         """The preflight must advertise MORE than the allowlist permits.
 
-        DELETE reaches exactly one route, so it would be tempting to narrow
-        Allow-Methods to it. That would make the browser block every other
-        DELETE and hand the extension an opaque failed fetch, replacing the
-        403 whose whole purpose is telling "not permitted here" from "wrong
-        credential". The gate, not the preflight, is the boundary.
+        Allow-Methods is per method, not per route, so dropping DELETE would
+        block the one DELETE the allowlist permits AND cost every withheld
+        DELETE its legible 403 -- the browser blocks the request and the
+        extension sees an opaque failed fetch instead of "not permitted
+        here". The gate, not the preflight, is the boundary.
         """
         advertised = {
             v.strip()

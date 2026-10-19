@@ -148,10 +148,8 @@ UI_ALLOWED_EXACT: frozenset[tuple[str, str]] = frozenset(
 
 UI_ALLOWED_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("POST", re.compile(r"^/queue/failed/\d+/retry$")),
-    # Destructive, and allowed anyway: the UI needs delete as an action
-    # (Devon, 2026-10-19). It names one id and delete_failed refuses a row
-    # whose status is not 'failed', so the blast radius is one dead letter.
-    # retry-all is the unscoped sibling and stays withheld.
+    # Destructive but scoped: it names one id, and delete_failed refuses a
+    # row whose status is not 'failed' in the DELETE itself.
     ("DELETE", re.compile(r"^/queue/failed/\d+$")),
     ("POST", re.compile(r"^/triage/questions/[A-Za-z0-9_-]+/answer$")),
     ("GET", re.compile(r"^/config/diff/\d+/\d+$")),
@@ -392,8 +390,9 @@ def init_auth(
         # else falls through to the normal gate.
         if request.method == "OPTIONS" and _allowed_origin():
             preflight = Response(status=204)
-            # DELETE and X-Updated-By are advertised although no UI_ALLOWED
-            # route accepts them. A preflight is not a security control -- the
+            # X-Updated-By is advertised although no UI_ALLOWED route accepts
+            # it, and DELETE reaches only one of them.
+            # A preflight is not a security control -- the
             # gate decides, and a withheld route is 403 either way -- but a
             # method omitted here is blocked by the BROWSER, so the extension
             # sees an opaque failed fetch instead of the deliberate 403.

@@ -150,6 +150,8 @@ class TestRetryFailed:
             "status": "failed",
         }
 
+        mock_execute_update.return_value = 1
+
         response = client.post("/queue/failed/1/retry")
 
         assert response.status_code == 200
@@ -162,6 +164,31 @@ class TestRetryFailed:
         assert "status = 'pending'" in update_args[0][0]
         assert "last_error = NULL" in update_args[0][0]
         assert "attempts = 0" in update_args[0][0]
+        # The row must still be failed at write time, not just at SELECT time.
+        assert "status = 'failed'" in update_args[0][0]
+
+    @patch("gateway.blueprints.queue.postgres.execute_update")
+    @patch("gateway.blueprints.queue.postgres.execute_one")
+    def test_returns_409_if_claimed_between_check_and_write(
+        self, mock_execute_one, mock_execute_update, client
+    ):
+        """The SELECT cannot hold the row, so the UPDATE can match nothing.
+
+        Without the predicate this reset a job another worker was already
+        processing, which runs it twice.
+        """
+        mock_execute_one.return_value = {
+            "id": 1,
+            "queue_name": "parse",
+            "gmail_id": "abc123",
+            "status": "failed",
+        }
+        mock_execute_update.return_value = 0
+
+        response = client.post("/queue/failed/1/retry")
+
+        assert response.status_code == 409
+        assert "no longer failed" in response.get_json()["error"]
 
     @patch("gateway.blueprints.queue.postgres.execute_one")
     def test_returns_404_if_not_found(self, mock_execute_one, client):
@@ -205,6 +232,8 @@ class TestDeleteFailed:
             "status": "failed",
         }
 
+        mock_execute_update.return_value = 1
+
         response = client.delete("/queue/failed/1")
 
         assert response.status_code == 200
@@ -215,6 +244,26 @@ class TestDeleteFailed:
         delete_args = mock_execute_update.call_args
         assert "DELETE FROM queue" in delete_args[0][0]
         assert delete_args[0][1] == (1,)
+        # The predicate is what keeps this from deleting live work.
+        assert "status = 'failed'" in delete_args[0][0]
+
+    @patch("gateway.blueprints.queue.postgres.execute_update")
+    @patch("gateway.blueprints.queue.postgres.execute_one")
+    def test_returns_409_if_claimed_between_check_and_delete(
+        self, mock_execute_one, mock_execute_update, client
+    ):
+        """Deleting a row that stopped being failed would lose live work."""
+        mock_execute_one.return_value = {
+            "id": 1,
+            "queue_name": "parse",
+            "status": "failed",
+        }
+        mock_execute_update.return_value = 0
+
+        response = client.delete("/queue/failed/1")
+
+        assert response.status_code == 409
+        assert "no longer failed" in response.get_json()["error"]
 
     @patch("gateway.blueprints.queue.postgres.execute_one")
     def test_returns_404_if_not_found(self, mock_execute_one, client):
