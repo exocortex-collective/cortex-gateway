@@ -8,6 +8,15 @@ from flask import Flask
 from gateway.blueprints.queue import queue_bp
 
 
+def where_clause(sql: str) -> str:
+    """The write's WHERE clause, whitespace collapsed.
+
+    Asserted whole rather than by substring: `status = 'failed'` is still
+    present in `WHERE id = %s OR status = 'failed'`, which deletes live work.
+    """
+    return " ".join(sql.split()).split("WHERE", 1)[1].strip()
+
+
 @pytest.fixture
 def app() -> Flask:
     """Create a Flask app for testing."""
@@ -165,17 +174,16 @@ class TestRetryFailed:
         assert "last_error = NULL" in update_args[0][0]
         assert "attempts = 0" in update_args[0][0]
         # The row must still be failed at write time, not just at SELECT time.
-        assert "status = 'failed'" in update_args[0][0]
+        assert where_clause(update_args[0][0]) == "id = %s AND status = 'failed'"
 
     @patch("gateway.blueprints.queue.postgres.execute_update")
     @patch("gateway.blueprints.queue.postgres.execute_one")
     def test_returns_409_if_claimed_between_check_and_write(
         self, mock_execute_one, mock_execute_update, client
     ):
-        """The SELECT cannot hold the row, so the UPDATE can match nothing.
+        """The UPDATE matches nothing once the job is no longer failed.
 
-        Without the predicate this reset a job another worker was already
-        processing, which runs it twice.
+        Resetting a row in 'processing' would run that job twice.
         """
         mock_execute_one.return_value = {
             "id": 1,
@@ -245,7 +253,7 @@ class TestDeleteFailed:
         assert "DELETE FROM queue" in delete_args[0][0]
         assert delete_args[0][1] == (1,)
         # The predicate is what keeps this from deleting live work.
-        assert "status = 'failed'" in delete_args[0][0]
+        assert where_clause(delete_args[0][0]) == "id = %s AND status = 'failed'"
 
     @patch("gateway.blueprints.queue.postgres.execute_update")
     @patch("gateway.blueprints.queue.postgres.execute_one")

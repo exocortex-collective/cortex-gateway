@@ -460,9 +460,10 @@ def retry_failed(job_id: int) -> Response | tuple[Response, int]:
     # The same fix landed at six sites in postmark and triage; these two were
     # missed because the audit enumerated those repos and cortex-utils, and not
     # this one.
-    # The status predicate is repeated here, not just checked above: the
-    # SELECT cannot hold the row, so between the two statements a worker can
-    # claim it. Resetting a row already in 'processing' runs the job twice.
+    #
+    # Repeat the status predicate in the write: the SELECT holds no lock, so a
+    # concurrent retry can move the row to pending and a worker can claim it,
+    # and resetting a row in 'processing' runs the job twice.
     update_query = """
         UPDATE queue
         SET status = 'pending', last_error = NULL, attempts = 0,
@@ -501,9 +502,8 @@ def delete_failed(job_id: int) -> Response | tuple[Response, int]:
             400,
         )
 
-    # Same check-then-act as retry_failed above, and here it loses the row:
-    # an unqualified DELETE drops a job that was retried and claimed between
-    # the SELECT and this statement.
+    # Same race as retry_failed, and here it loses the row: the predicate
+    # stops a retried-and-claimed job being deleted.
     delete_query = "DELETE FROM queue WHERE id = %s AND status = 'failed'"
     if not postgres.execute_update(delete_query, (job_id,)):
         return jsonify({"error": "Job is no longer failed"}), 409
