@@ -26,7 +26,13 @@ from flask import Flask, Response, jsonify
 from flask.testing import FlaskClient
 from werkzeug.test import TestResponse
 
-from gateway.auth import UI_ALLOWED_EXACT, UI_ALLOWED_PATTERNS, _ui_route_allowed, init_auth
+from gateway.auth import (
+    UI_ALLOWED_EXACT,
+    UI_ALLOWED_PATTERNS,
+    _is_exempt,
+    _ui_route_allowed,
+    init_auth,
+)
 
 API_TOKEN = "api-token-fixture"
 UI_TOKEN = "ui-token-fixture"
@@ -80,6 +86,21 @@ DENIED_ROUTES = (
     ("/mappings/851", ("PUT", "DELETE")),
     ("/oauth/status", ("GET",)),
     ("/sync/backfill", ("POST",)),
+)
+
+# One wrong method per exact path. Grouped by PATH first, because a method
+# that is wrong for one entry can be another entry's allowed one -- /mappings
+# takes both GET and POST. An exempt path is skipped: /health is on the
+# allowlist AND in EXEMPT_PATHS, so it never reaches the token gate and
+# answers no method with 403.
+_METHODS_BY_PATH: dict[str, set[str]] = {}
+for _method, _path in UI_ALLOWED_EXACT:
+    _METHODS_BY_PATH.setdefault(_path, set()).add(_method)
+
+WRONG_METHOD_EXACT = tuple(
+    (next(m for m in ("GET", "POST", "PUT", "DELETE") if m not in methods), path)
+    for path, methods in sorted(_METHODS_BY_PATH.items())
+    if not _is_exempt(path)
 )
 
 ROUTES = (
@@ -286,6 +307,19 @@ class TestTheUiTokenIsScoped:
         """
         assert _ui(client, wrong_method, path).status_code == 403
 
+    @pytest.mark.parametrize("wrong_method,path", WRONG_METHOD_EXACT)
+    def test_an_exact_entry_does_not_accept_another_method(
+        self, client: FlaskClient, wrong_method: str, path: str
+    ) -> None:
+        """The method is half of each exact entry, and only one was asserted.
+
+        Making the exact lookup ignore the method left every entry but
+        /triage/rerun green, so each one silently took any verb.
+        """
+        r = _ui(client, wrong_method, path)
+        assert r.status_code == 403
+        assert r.get_json()["error"] == "token not permitted for this route"
+
     @pytest.mark.parametrize("path", ["/mappings/", "/MAPPINGS", "/Mappings"])
     def test_the_gate_matches_the_path_exactly(self, client: FlaskClient, path: str) -> None:
         """No trailing-slash or case folding: ("GET", "/mappings") is allowed
@@ -391,8 +425,6 @@ class TestTheUiTokenIsScoped:
             ("DELETE", "/mappings/851", "removes a precedent"),
             ("PUT", "/mappings/851", "edits a precedent"),
             ("POST", "/queue/failed/retry-all", "bulk, unscoped by id"),
-            ("GET", "/triage/rerun", "the entry is POST; another method is not it"),
-            ("DELETE", "/triage/rerun", "same"),
             ("POST", "/triage/rerun/extra", "an exact entry matches no sub-path"),
         ],
     )

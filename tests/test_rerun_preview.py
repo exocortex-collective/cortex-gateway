@@ -198,11 +198,7 @@ class TestPreview:
         assert data["preview"] is False
 
     def test_auth_no_longer_carries_a_preview_predicate(self):
-        """auth.py must not define its own preview predicate.
-
-        Asserting the absence, not agreement between two copies: a second
-        definition is how the gate and the handler came to disagree in #40.
-        """
+        """auth.py must not define its own preview predicate."""
         assert not hasattr(gateway.auth, "is_preview")
 
 

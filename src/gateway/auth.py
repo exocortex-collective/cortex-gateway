@@ -142,8 +142,7 @@ UI_ALLOWED_EXACT: frozenset[tuple[str, str]] = frozenset(
         # The question-answer path writes a mapping, so the UI needs POST.
         # PUT and DELETE stay out: answering a question adds a precedent.
         ("POST", "/mappings"),
-        # Devon's call (kp9.3): the UI may start a real rerun, not only
-        # preview one.
+        # Devon's call (kp9.3): the UI may start a real rerun.
         ("POST", "/triage/rerun"),
     }
 )
