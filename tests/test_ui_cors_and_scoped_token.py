@@ -26,7 +26,13 @@ from flask import Flask, Response, jsonify
 from flask.testing import FlaskClient
 from werkzeug.test import TestResponse
 
-from gateway.auth import UI_ALLOWED_EXACT, UI_ALLOWED_PATTERNS, _ui_route_allowed, init_auth
+from gateway.auth import (
+    UI_ALLOWED_EXACT,
+    UI_ALLOWED_PATTERNS,
+    _is_exempt,
+    _ui_route_allowed,
+    init_auth,
+)
 
 API_TOKEN = "api-token-fixture"
 UI_TOKEN = "ui-token-fixture"
@@ -76,12 +82,25 @@ PATTERN_SAMPLES = (
 # handlers only need to exist for the allowed cases to come back 200.
 DENIED_ROUTES = (
     ("/queue/failed/retry-all", ("POST",)),
-    # Conditional, not denied: allowed only with a truthy ?preview=.
-    ("/triage/rerun", ("POST",)),
     ("/config", ("GET", "PUT")),
     ("/mappings/851", ("PUT", "DELETE")),
     ("/oauth/status", ("GET",)),
     ("/sync/backfill", ("POST",)),
+)
+
+# One wrong method per exact path. Grouped by PATH first, because a method
+# that is wrong for one entry can be another entry's allowed one -- /mappings
+# takes both GET and POST. An exempt path is skipped: /health is on the
+# allowlist AND in EXEMPT_PATHS, so it never reaches the token gate and
+# answers no method with 403.
+_METHODS_BY_PATH: dict[str, set[str]] = {}
+for _method, _path in UI_ALLOWED_EXACT:
+    _METHODS_BY_PATH.setdefault(_path, set()).add(_method)
+
+WRONG_METHOD_EXACT = tuple(
+    (next(m for m in ("GET", "POST", "PUT", "DELETE") if m not in methods), path)
+    for path, methods in sorted(_METHODS_BY_PATH.items())
+    if not _is_exempt(path)
 )
 
 ROUTES = (
@@ -288,6 +307,36 @@ class TestTheUiTokenIsScoped:
         """
         assert _ui(client, wrong_method, path).status_code == 403
 
+    def test_the_generated_cases_cover_every_non_exempt_exact_path(self) -> None:
+        """Written out independently, so filtering the comprehension fails here.
+
+        Not a case count: that would fail on the next allowlist entry and get
+        bumped without thought, and it catches nothing the allowlist snapshot
+        and the skip pin below do not already catch.
+        """
+        assert {path for _wrong, path in WRONG_METHOD_EXACT} == {
+            path for _method, path in UI_ALLOWED_EXACT if not _is_exempt(path)
+        }
+
+    def test_only_health_is_skipped_as_exempt(self) -> None:
+        """Exempting an allowlisted path deletes its wrong-method case silently.
+
+        Adding one to EXEMPT_PATHS drops a case from WRONG_METHOD_EXACT and
+        the suite stays green, so the skipped set is pinned rather than the
+        count: this fails on the exemption, not on the next allowlist entry.
+        """
+        skipped = {path for path in _METHODS_BY_PATH if _is_exempt(path)}
+        assert skipped == {"/health"}
+
+    @pytest.mark.parametrize("wrong_method,path", WRONG_METHOD_EXACT)
+    def test_an_exact_entry_does_not_accept_another_method(
+        self, client: FlaskClient, wrong_method: str, path: str
+    ) -> None:
+        """The method is half of each exact entry."""
+        r = _ui(client, wrong_method, path)
+        assert r.status_code == 403
+        assert r.get_json()["error"] == "token not permitted for this route"
+
     @pytest.mark.parametrize("path", ["/mappings/", "/MAPPINGS", "/Mappings"])
     def test_the_gate_matches_the_path_exactly(self, client: FlaskClient, path: str) -> None:
         """No trailing-slash or case folding: ("GET", "/mappings") is allowed
@@ -360,6 +409,7 @@ class TestTheUiTokenIsScoped:
                 ("GET", "/config/versions"),
                 ("GET", "/mappings"),
                 ("POST", "/mappings"),
+                ("POST", "/triage/rerun"),
             }
         )
 
@@ -392,6 +442,7 @@ class TestTheUiTokenIsScoped:
             ("DELETE", "/mappings/851", "removes a precedent"),
             ("PUT", "/mappings/851", "edits a precedent"),
             ("POST", "/queue/failed/retry-all", "bulk, unscoped by id"),
+            ("POST", "/triage/rerun/extra", "an exact entry matches no sub-path"),
         ],
     )
     def test_everything_else_is_403_not_401(
@@ -405,25 +456,18 @@ class TestTheUiTokenIsScoped:
         assert r.status_code == 403, why
         assert r.get_json()["error"] == "token not permitted for this route"
 
-    @pytest.mark.parametrize("query", ["?preview=1", "?preview=true", "?preview=YES"])
-    def test_rerun_is_allowed_only_with_a_truthy_preview(
+    @pytest.mark.parametrize(
+        "query", ["", "?preview=1", "?preview=0", "?preview=false", "?preview=maybe"]
+    )
+    def test_rerun_is_allowed_whatever_the_query_string_says(
         self, client: FlaskClient, query: str
     ) -> None:
-        """This PR adds the preview branch, so the permission is sound here.
+        """The empty query is the case that matters: it is the enqueueing form.
 
-        #40 shipped the same conditional while blueprints/triage.py had no
-        preview handling at all, which made it a permission to do the bulk
-        enqueue it reads as withholding. The gate and the route now share one
-        is_preview, so they cannot disagree about what a preview is.
+        The ?preview= values are here so that a condition on the query string
+        fails rather than silently narrowing what the UI may call.
         """
         assert _ui(client, "POST", f"/triage/rerun{query}").status_code == 200
-
-    @pytest.mark.parametrize("query", ["", "?preview=0", "?preview=false", "?preview=maybe"])
-    def test_rerun_without_a_truthy_preview_is_denied(
-        self, client: FlaskClient, query: str
-    ) -> None:
-        """Without preview it enqueues thousands of rows at a chosen priority."""
-        assert _ui(client, "POST", f"/triage/rerun{query}").status_code == 403
 
     def test_the_full_token_still_reaches_everything(self, client: FlaskClient) -> None:
         """The scoped token must not have narrowed the real one."""
@@ -534,14 +578,14 @@ class TestCorsOnRejections:
 class TestTheAllowlistItself:
     def test_an_unlisted_route_is_closed_by_default(self) -> None:
         """A route added later must be denied until someone lists it."""
-        assert not _ui_route_allowed("GET", "/some/future/route", {})
+        assert not _ui_route_allowed("GET", "/some/future/route")
 
     def test_pattern_routes_do_not_over_match(self) -> None:
-        assert _ui_route_allowed("POST", "/queue/failed/5/retry", {})
-        assert not _ui_route_allowed("POST", "/queue/failed/5/retry/extra", {})
-        assert _ui_route_allowed("DELETE", "/queue/failed/5", {})
-        assert not _ui_route_allowed("DELETE", "/queue/failed/5/extra", {})
+        assert _ui_route_allowed("POST", "/queue/failed/5/retry")
+        assert not _ui_route_allowed("POST", "/queue/failed/5/retry/extra")
+        assert _ui_route_allowed("DELETE", "/queue/failed/5")
+        assert not _ui_route_allowed("DELETE", "/queue/failed/5/extra")
 
     def test_method_is_part_of_the_match(self) -> None:
-        assert _ui_route_allowed("GET", "/mappings", {})
-        assert not _ui_route_allowed("DELETE", "/mappings", {})
+        assert _ui_route_allowed("GET", "/mappings")
+        assert not _ui_route_allowed("DELETE", "/mappings")

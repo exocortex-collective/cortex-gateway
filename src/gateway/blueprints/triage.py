@@ -1,17 +1,23 @@
 """Triage-related API endpoints."""
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from cortex_utils.logging import get_logger
 from flask import Blueprint, jsonify, request
 
-from gateway.auth import is_preview
 from gateway.services import postgres
 from gateway.services.postgres import ConnectionContext
 
 triage_bp = Blueprint("triage", __name__)
 logger = get_logger()
+
+
+def is_preview(args: Mapping[str, str]) -> bool:
+    """A truthy ?preview= value. "0" and "false" do not count."""
+    raw = (args.get("preview") or "").strip().lower()
+    return raw in ("1", "true", "yes")
 
 
 @triage_bp.route("/stats")
