@@ -185,10 +185,10 @@ class TestPreview:
     @pytest.mark.parametrize("raw", ["0", "false", "no", "", "maybe"])
     @patch("gateway.blueprints.triage.postgres.execute_update")
     def test_a_falsey_preview_enqueues_for_real(self, mock_update, raw, client):
-        """It must agree with auth.is_preview, which gates the scoped token.
+        """Only "1", "true" and "yes" withhold the write.
 
-        If this accepted a value the allowlist rejects -- or vice versa -- the
-        UI token could reach the enqueueing form of the route.
+        Reading an unrecognised value as a preview would be the dangerous
+        default: the caller asked for a rerun, saw a count, and got nothing.
         """
         mock_update.return_value = 1
         data = client.post(
@@ -196,12 +196,16 @@ class TestPreview:
         ).get_json()
         assert data["preview"] is False
 
-    def test_the_predicate_is_shared_with_auth_not_copied(self):
-        """One definition, so the two cannot drift apart."""
-        from gateway.auth import is_preview as auth_version
-        from gateway.blueprints.triage import is_preview as triage_version
+    def test_auth_no_longer_carries_a_preview_predicate(self):
+        """The gate stopped reading the query string; nothing there should.
 
-        assert auth_version is triage_version
+        A second definition in auth.py is how the gate and the handler drifted
+        apart once before (#40), so assert the module has none at all rather
+        than that the two agree.
+        """
+        import gateway.auth as auth
+
+        assert not hasattr(auth, "is_preview")
 
 
 class TestParameterValidation:

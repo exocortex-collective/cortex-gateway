@@ -76,8 +76,6 @@ PATTERN_SAMPLES = (
 # handlers only need to exist for the allowed cases to come back 200.
 DENIED_ROUTES = (
     ("/queue/failed/retry-all", ("POST",)),
-    # Conditional, not denied: allowed only with a truthy ?preview=.
-    ("/triage/rerun", ("POST",)),
     ("/config", ("GET", "PUT")),
     ("/mappings/851", ("PUT", "DELETE")),
     ("/oauth/status", ("GET",)),
@@ -360,6 +358,7 @@ class TestTheUiTokenIsScoped:
                 ("GET", "/config/versions"),
                 ("GET", "/mappings"),
                 ("POST", "/mappings"),
+                ("POST", "/triage/rerun"),
             }
         )
 
@@ -405,25 +404,21 @@ class TestTheUiTokenIsScoped:
         assert r.status_code == 403, why
         assert r.get_json()["error"] == "token not permitted for this route"
 
-    @pytest.mark.parametrize("query", ["?preview=1", "?preview=true", "?preview=YES"])
-    def test_rerun_is_allowed_only_with_a_truthy_preview(
+    @pytest.mark.parametrize(
+        "query", ["", "?preview=1", "?preview=0", "?preview=false", "?preview=maybe"]
+    )
+    def test_rerun_is_allowed_whatever_the_query_string_says(
         self, client: FlaskClient, query: str
     ) -> None:
-        """This PR adds the preview branch, so the permission is sound here.
+        """Devon's call (kp9.3): the UI starts real reruns, not only previews.
 
-        #40 shipped the same conditional while blueprints/triage.py had no
-        preview handling at all, which made it a permission to do the bulk
-        enqueue it reads as withholding. The gate and the route now share one
-        is_preview, so they cannot disagree about what a preview is.
+        The empty query is the case that matters -- it is the enqueueing form,
+        which this route gated behind api_token until now. The ?preview= values
+        are here because the gate used to read them: a reintroduced condition
+        on the query string fails on one of these rather than silently
+        narrowing the permission the UI depends on.
         """
         assert _ui(client, "POST", f"/triage/rerun{query}").status_code == 200
-
-    @pytest.mark.parametrize("query", ["", "?preview=0", "?preview=false", "?preview=maybe"])
-    def test_rerun_without_a_truthy_preview_is_denied(
-        self, client: FlaskClient, query: str
-    ) -> None:
-        """Without preview it enqueues thousands of rows at a chosen priority."""
-        assert _ui(client, "POST", f"/triage/rerun{query}").status_code == 403
 
     def test_the_full_token_still_reaches_everything(self, client: FlaskClient) -> None:
         """The scoped token must not have narrowed the real one."""
@@ -534,14 +529,14 @@ class TestCorsOnRejections:
 class TestTheAllowlistItself:
     def test_an_unlisted_route_is_closed_by_default(self) -> None:
         """A route added later must be denied until someone lists it."""
-        assert not _ui_route_allowed("GET", "/some/future/route", {})
+        assert not _ui_route_allowed("GET", "/some/future/route")
 
     def test_pattern_routes_do_not_over_match(self) -> None:
-        assert _ui_route_allowed("POST", "/queue/failed/5/retry", {})
-        assert not _ui_route_allowed("POST", "/queue/failed/5/retry/extra", {})
-        assert _ui_route_allowed("DELETE", "/queue/failed/5", {})
-        assert not _ui_route_allowed("DELETE", "/queue/failed/5/extra", {})
+        assert _ui_route_allowed("POST", "/queue/failed/5/retry")
+        assert not _ui_route_allowed("POST", "/queue/failed/5/retry/extra")
+        assert _ui_route_allowed("DELETE", "/queue/failed/5")
+        assert not _ui_route_allowed("DELETE", "/queue/failed/5/extra")
 
     def test_method_is_part_of_the_match(self) -> None:
-        assert _ui_route_allowed("GET", "/mappings", {})
-        assert not _ui_route_allowed("DELETE", "/mappings", {})
+        assert _ui_route_allowed("GET", "/mappings")
+        assert not _ui_route_allowed("DELETE", "/mappings")

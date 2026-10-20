@@ -122,8 +122,7 @@ def _is_exempt(path: str) -> bool:
 # /mappings (a precedent should be added from the UI, not silently removed),
 # /sync/* and /backfill/* (they spend Gmail API quota), /oauth/* (credential
 # management, and /oauth/status returns a server filesystem path),
-# POST /queue/failed/retry-all (bulk, unscoped by id). POST /triage/rerun is
-# conditional rather than withheld -- see _ui_route_allowed.
+# POST /queue/failed/retry-all (bulk, unscoped by id).
 UI_ALLOWED_EXACT: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/health"),
@@ -143,6 +142,10 @@ UI_ALLOWED_EXACT: frozenset[tuple[str, str]] = frozenset(
         # The question-answer path writes a mapping, so the UI needs POST.
         # PUT and DELETE stay out: answering a question adds a precedent.
         ("POST", "/mappings"),
+        # Devon's call (kp9.3): the UI may start a real rerun, not only
+        # preview one. It enqueues at the body's priority, default -100, so a
+        # rerun queues behind live mail.
+        ("POST", "/triage/rerun"),
     }
 )
 
@@ -178,34 +181,15 @@ def _token_matches(presented: str | None, expected: str) -> bool:
     )
 
 
-def _ui_route_allowed(method: str, path: str, args: Any) -> bool:
+def _ui_route_allowed(method: str, path: str) -> bool:
     """Whether the scoped UI token may call this method and path.
 
-    POST /triage/rerun is the one conditional case. With ?preview=1 the route
-    runs its INSERT and rolls back, reporting a count and writing nothing, so
-    the UI may ask. Without preview the same path enqueues thousands of rows
-    at a chosen priority, so it stays with api_token.
-
-    This permission is only sound while blueprints/triage.py honours
-    ?preview=; the gate and the route share is_preview so they cannot
-    disagree about what one is.
+    The query string is never consulted: a gate that reads it has to agree
+    with the handler about what it means, and the two can drift.
     """
     if (method, path) in UI_ALLOWED_EXACT:
         return True
-    if method == "POST" and path == "/triage/rerun":
-        return is_preview(args)
     return any(m == method and pat.match(path) for m, pat in UI_ALLOWED_PATTERNS)
-
-
-def is_preview(args: Any) -> bool:
-    """A truthy ?preview= value. "0" and "false" do not count.
-
-    Public because blueprints/triage.py imports it: the gate's notion of
-    "this is a preview" and the route's must be the same function, or the
-    allowlist permits one thing and the handler does another.
-    """
-    raw = (args.get("preview") or "").strip().lower()
-    return raw in ("1", "true", "yes")
 
 
 def _parse_subnets(raw: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
@@ -427,7 +411,7 @@ def init_auth(
         # the UI, the second is a misconfigured credential, and a single 401
         # for both sends the user to re-enter a token that was fine.
         if _token_matches(presented, ui_token):
-            if _ui_route_allowed(request.method, path, request.args):
+            if _ui_route_allowed(request.method, path):
                 return None
             logger.warning(
                 "ui_token_route_denied",
@@ -479,4 +463,4 @@ def _presented_token(headers: Any) -> str:
     return direct.strip()
 
 
-__all__ = ["init_auth", "is_internal", "is_preview"]
+__all__ = ["init_auth", "is_internal"]
