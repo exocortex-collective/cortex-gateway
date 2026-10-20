@@ -1,5 +1,6 @@
 """Triage-related API endpoints."""
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -13,7 +14,7 @@ triage_bp = Blueprint("triage", __name__)
 logger = get_logger()
 
 
-def is_preview(args: Any) -> bool:
+def is_preview(args: Mapping[str, str]) -> bool:
     """A truthy ?preview= value. "0" and "false" do not count."""
     raw = (args.get("preview") or "").strip().lower()
     return raw in ("1", "true", "yes")

@@ -391,6 +391,9 @@ class TestTheUiTokenIsScoped:
             ("DELETE", "/mappings/851", "removes a precedent"),
             ("PUT", "/mappings/851", "edits a precedent"),
             ("POST", "/queue/failed/retry-all", "bulk, unscoped by id"),
+            ("GET", "/triage/rerun", "the entry is POST; another method is not it"),
+            ("DELETE", "/triage/rerun", "same"),
+            ("POST", "/triage/rerun/extra", "an exact entry matches no sub-path"),
         ],
     )
     def test_everything_else_is_403_not_401(
@@ -410,13 +413,10 @@ class TestTheUiTokenIsScoped:
     def test_rerun_is_allowed_whatever_the_query_string_says(
         self, client: FlaskClient, query: str
     ) -> None:
-        """Devon's call (kp9.3): the UI starts real reruns, not only previews.
+        """The empty query is the case that matters: it is the enqueueing form.
 
-        The empty query is the case that matters -- it is the enqueueing form,
-        which this route gated behind api_token until now. The ?preview= values
-        are here because the gate used to read them: a reintroduced condition
-        on the query string fails on one of these rather than silently
-        narrowing the permission the UI depends on.
+        The ?preview= values are here so that a condition on the query string
+        fails rather than silently narrowing what the UI may call.
         """
         assert _ui(client, "POST", f"/triage/rerun{query}").status_code == 200
 

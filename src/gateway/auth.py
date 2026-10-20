@@ -143,8 +143,7 @@ UI_ALLOWED_EXACT: frozenset[tuple[str, str]] = frozenset(
         # PUT and DELETE stay out: answering a question adds a precedent.
         ("POST", "/mappings"),
         # Devon's call (kp9.3): the UI may start a real rerun, not only
-        # preview one. It enqueues at the body's priority, default -100, so a
-        # rerun queues behind live mail.
+        # preview one.
         ("POST", "/triage/rerun"),
     }
 )
@@ -184,8 +183,7 @@ def _token_matches(presented: str | None, expected: str) -> bool:
 def _ui_route_allowed(method: str, path: str) -> bool:
     """Whether the scoped UI token may call this method and path.
 
-    The query string is never consulted: a gate that reads it has to agree
-    with the handler about what it means, and the two can drift.
+    The query string is never consulted.
     """
     if (method, path) in UI_ALLOWED_EXACT:
         return True

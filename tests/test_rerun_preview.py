@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from flask import Flask
 
+import gateway.auth
 from gateway.blueprints.triage import triage_bp
 
 
@@ -197,15 +198,12 @@ class TestPreview:
         assert data["preview"] is False
 
     def test_auth_no_longer_carries_a_preview_predicate(self):
-        """The gate stopped reading the query string; nothing there should.
+        """auth.py must not define its own preview predicate.
 
-        A second definition in auth.py is how the gate and the handler drifted
-        apart once before (#40), so assert the module has none at all rather
-        than that the two agree.
+        Asserting the absence, not agreement between two copies: a second
+        definition is how the gate and the handler came to disagree in #40.
         """
-        import gateway.auth as auth
-
-        assert not hasattr(auth, "is_preview")
+        assert not hasattr(gateway.auth, "is_preview")
 
 
 class TestParameterValidation:
