@@ -307,6 +307,17 @@ class TestTheUiTokenIsScoped:
         """
         assert _ui(client, wrong_method, path).status_code == 403
 
+    def test_the_generated_cases_cover_every_non_exempt_exact_path(self) -> None:
+        """Written out independently, so filtering the comprehension fails here.
+
+        Not a case count: that would fail on the next allowlist entry and get
+        bumped without thought, and it catches nothing the allowlist snapshot
+        and the skip pin below do not already catch.
+        """
+        assert {path for _wrong, path in WRONG_METHOD_EXACT} == {
+            path for _method, path in UI_ALLOWED_EXACT if not _is_exempt(path)
+        }
+
     def test_only_health_is_skipped_as_exempt(self) -> None:
         """Exempting an allowlisted path deletes its wrong-method case silently.
 
