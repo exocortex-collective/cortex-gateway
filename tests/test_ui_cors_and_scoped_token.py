@@ -307,15 +307,21 @@ class TestTheUiTokenIsScoped:
         """
         assert _ui(client, wrong_method, path).status_code == 403
 
+    def test_only_health_is_skipped_as_exempt(self) -> None:
+        """Exempting an allowlisted path deletes its wrong-method case silently.
+
+        Adding one to EXEMPT_PATHS drops a case from WRONG_METHOD_EXACT and
+        the suite stays green, so the skipped set is pinned rather than the
+        count: this fails on the exemption, not on the next allowlist entry.
+        """
+        skipped = {path for path in _METHODS_BY_PATH if _is_exempt(path)}
+        assert skipped == {"/health"}
+
     @pytest.mark.parametrize("wrong_method,path", WRONG_METHOD_EXACT)
     def test_an_exact_entry_does_not_accept_another_method(
         self, client: FlaskClient, wrong_method: str, path: str
     ) -> None:
-        """The method is half of each exact entry, and only one was asserted.
-
-        Making the exact lookup ignore the method left every entry but
-        /triage/rerun green, so each one silently took any verb.
-        """
+        """The method is half of each exact entry."""
         r = _ui(client, wrong_method, path)
         assert r.status_code == 403
         assert r.get_json()["error"] == "token not permitted for this route"
