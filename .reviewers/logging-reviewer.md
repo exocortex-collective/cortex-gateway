@@ -175,6 +175,7 @@ CLI tools follow Unix's rule of silence: *when a program has nothing surprising 
 - Logging configuration in a single canonical entry point of an application (that's exactly where it belongs).
 - Eager formatting in cold paths (a once-at-startup log line). The lazy-formatting rule only matters in hot loops.
 - CLI tools that use `click.echo()` / `click.secho()` — these are Click's stderr-aware print equivalents and respect Click's output conventions.
+- **Mail-derived PII** — an address, display name or subject line — in a log on a host that already holds the mail corpus. The log sits next to the mail it came from, so it is the same exposure rather than a new one. Scope, and it is the whole of the rule: this holds only while the logs stay on that host. Check for a shipper (loki/promtail/vector/fluent, a non-default `log-opts` or a `daemon.json` logging driver) before applying it, and flag normally if one exists. It does NOT cover credentials — rule 1 is unchanged — nor PII crossing a real boundary: a Discord alert, an LLM prompt, a PR comment, or a `str(exc)` that can reach a public repo.
 
 ### Review approach
 
