@@ -20,7 +20,7 @@ Review Python code for **logging discipline**. Logging is observability infrastr
 
    Flag string interpolation of variables named `token`, `password`, `secret`, `api_key`, `credential`, `auth`, `cookie`, `session`, `private_key`, or `bearer` into any log call. Also flag dumping entire request/response objects without redaction — `request.headers` typically contains `Authorization`.
 
-   Acceptable: explicit redaction (`token[:8] + "..."`), or logging a hash/fingerprint instead of the value. Mail-derived PII on a host that already holds the corpus is exempt — see **Do NOT flag**.
+   Acceptable: explicit redaction (`token[:8] + "..."`), or logging a hash/fingerprint instead of the value. Mail-derived PII on a host that already holds the corpus is exempt *while the logs stay on that host* — see **Do NOT flag** for the conditions.
 
 2. **`logger.error(...)` inside an `except` block without `exc_info=True`:**
 
