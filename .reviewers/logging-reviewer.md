@@ -20,7 +20,7 @@ Review Python code for **logging discipline**. Logging is observability infrastr
 
    Flag string interpolation of variables named `token`, `password`, `secret`, `api_key`, `credential`, `auth`, `cookie`, `session`, `private_key`, or `bearer` into any log call. Also flag dumping entire request/response objects without redaction — `request.headers` typically contains `Authorization`.
 
-   Acceptable: explicit redaction (`token[:8] + "..."`), or logging a hash/fingerprint instead of the value.
+   Acceptable: explicit redaction (`token[:8] + "..."`), or logging a hash/fingerprint instead of the value. Mail-derived PII on a host that already holds the corpus is exempt *while the logs stay on that host* — see **Do NOT flag** for the conditions.
 
 2. **`logger.error(...)` inside an `except` block without `exc_info=True`:**
 
@@ -175,6 +175,7 @@ CLI tools follow Unix's rule of silence: *when a program has nothing surprising 
 - Logging configuration in a single canonical entry point of an application (that's exactly where it belongs).
 - Eager formatting in cold paths (a once-at-startup log line). The lazy-formatting rule only matters in hot loops.
 - CLI tools that use `click.echo()` / `click.secho()` — these are Click's stderr-aware print equivalents and respect Click's output conventions.
+- **Mail-derived PII** — an address, display name or subject line — in a log on a host that already holds the mail corpus: the same exposure, not a new one. Only while the logs stay on that host, so check for a shipper first (loki/promtail/vector/fluent, a non-default `log-opts` or `daemon.json` driver) and flag normally if there is one. Credentials are not covered (rule 1 stands), nor is PII crossing a real boundary: a Discord alert, an LLM prompt, a PR comment, or a `str(exc)` that can reach a public repo.
 
 ### Review approach
 
