@@ -2,10 +2,13 @@
 
 from typing import Any
 
+from cortex_utils.logging import get_logger
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 
 from gateway.config import config
+
+logger = get_logger()
 
 # Connection pool (initialized lazily)
 _pool: pool.ThreadedConnectionPool | None = None
@@ -31,9 +34,18 @@ def get_connection() -> Any:
 
 
 def put_connection(conn: Any) -> None:
-    """Return a connection to the pool."""
-    if _pool is not None:
+    """Return a connection to the pool, freeing the slot even if that fails.
+
+    putconn's own rollback can raise before it frees the slot; close=True
+    skips that rollback.
+    """
+    if _pool is None:
+        return
+    try:
         _pool.putconn(conn)
+    except Exception as exc:
+        logger.warning("putconn_failed", error_type=type(exc).__name__)
+        _pool.putconn(conn, close=True)
 
 
 class ConnectionContext:
@@ -47,10 +59,17 @@ class ConnectionContext:
         return self.conn
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Always release the connection, even if the rollback raises."""
         if self.conn:
-            if exc_type is not None:
-                self.conn.rollback()
-            put_connection(self.conn)
+            try:
+                if exc_type is not None:
+                    self.conn.rollback()
+            except Exception as exc:
+                # error_type only: psycopg2 messages carry DETAIL lines
+                # holding row values.
+                logger.warning("rollback_failed", error_type=type(exc).__name__)
+            finally:
+                put_connection(self.conn)
 
 
 def execute_query(query: str, params: tuple[Any, ...] | None = None) -> list[dict[str, Any]]:

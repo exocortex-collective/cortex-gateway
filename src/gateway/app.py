@@ -18,7 +18,7 @@ from gateway.blueprints import (
     triage_bp,
 )
 from gateway.config import config
-from gateway.services.postgres import get_connection, init_pool
+from gateway.services.postgres import ConnectionContext, init_pool
 
 logger = get_logger()
 
@@ -49,7 +49,14 @@ def create_app() -> Flask:
     # Require a token for anything arriving from outside the container network
     # Raises if a token is set without trusted subnets: refusing to start is a
     # better failure than every peer call beginning to 401 at once.
-    init_auth(app, config.api_token, config.trusted_subnets, config.internal_port)
+    init_auth(
+        app,
+        config.api_token,
+        config.trusted_subnets,
+        config.internal_port,
+        ui_token=config.ui_token,
+        ui_origins=config.ui_origins,
+    )
 
     # Apply metrics middleware
     app.wsgi_app = MetricsMiddleware(app.wsgi_app, "cortex-gateway")  # type: ignore[method-assign]
@@ -89,12 +96,12 @@ def create_app() -> Flask:
 def check_postgres() -> tuple[str, bool]:
     """Health check for Postgres connection."""
     try:
-        conn = get_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
+        with ConnectionContext() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
         return ("postgres", True)
     except Exception as e:
-        logger.warning("postgres_health_check_failed", error=e)
+        logger.warning("postgres_health_check_failed", error_type=type(e).__name__)
         return ("postgres", False)
 
 
@@ -104,7 +111,7 @@ def check_duckdb() -> tuple[str, bool]:
         resp = httpx.get(f"{config.duckdb_api_url}/health", timeout=5.0)
         return ("duckdb", resp.status_code == 200)
     except httpx.RequestError as e:
-        logger.warning("duckdb_health_check_failed", error=e)
+        logger.warning("duckdb_health_check_failed", error_type=type(e).__name__)
         return ("duckdb", False)
 
 

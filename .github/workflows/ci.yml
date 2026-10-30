@@ -5,10 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
-  REGISTRY: us-central1-docker.pkg.dev
-  IMAGE_NAME: cortex-gmail/cortex/gateway
+  REGISTRY: ghcr.io
+  IMAGE_NAME: exocortex-collective/gateway
 
 jobs:
   lint:
@@ -36,6 +37,21 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # For the *_live.py tests: config versioning lives in triggers a mock cannot run.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      CORTEX_TEST_DSN: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres"
     steps:
       - uses: actions/checkout@v7
 
@@ -51,28 +67,29 @@ jobs:
       - name: Run tests
         run: uv run pytest
 
+      - name: Fail if the live-Postgres tests were skipped
+        run: uv run pytest tests/*_live.py -q -p no:skipping
+
   build:
     runs-on: ubuntu-latest
     needs: [lint, test]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
-      id-token: write
+      packages: write
 
     steps:
       - uses: actions/checkout@v7
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          workload_identity_provider: projects/63779650346/locations/global/workloadIdentityPools/github-actions/providers/github-provider
-          service_account: github-actions@cortex-gmail.iam.gserviceaccount.com
-
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Docker image
-        run: docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest .
+        run: docker build --label org.opencontainers.image.source=https://github.com/${{ github.repository }} -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest .
 
       - name: Push Docker image
         run: |
