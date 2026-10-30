@@ -587,6 +587,49 @@ def test_create_app_binds_the_gate_to_the_internal_port_not_the_external_one(
     ), "the same peer on the EXTERNAL port must be challenged"
 
 
+def test_create_app_wires_the_ui_token_and_origins_through(monkeypatch, reloaded_gateway) -> None:
+    """The real chain: env -> Config -> create_app -> init_auth.
+
+    Every other scoped-token test calls init_auth directly with literals, so
+    none of them sees this call site. Dropping both arguments here passed the
+    whole suite while leaving the feature dead in production: the extension
+    would 401 on every request and the startup log would say ui_token_set=False.
+    """
+    origin = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    monkeypatch.setenv("CORTEX_API_TOKEN", "s3cret")
+    monkeypatch.setenv("CORTEX_TRUSTED_SUBNETS", "172.26.0.0/16")
+    monkeypatch.setenv("CORTEX_UI_TOKEN", "ui-s3cret")
+    monkeypatch.setenv("CORTEX_UI_ORIGINS", origin)
+    monkeypatch.setenv("POSTGRES_PASSWORD", "x")
+    monkeypatch.setenv("OAUTH_SECRET_KEY", "x")
+    monkeypatch.setenv("OAUTH_TOKEN_PATH", "/tmp/t.json")
+
+    gateway_app = reloaded_gateway()
+    with (
+        patch("gateway.app.init_pool"),
+        patch("gateway.app.start_metrics_server"),
+    ):
+        app = gateway_app.create_app()
+
+    client = app.test_client()
+    external = "http://localhost:8098"
+    ui = {"Authorization": "Bearer ui-s3cret", "Origin": origin}
+
+    # ONE request, answered by the gate before dispatch, carrying both halves
+    # of the claim: 403 rather than 401 proves ui_token was wired in (an
+    # unconfigured one makes this 401), and the CORS header on that same
+    # response proves ui_origins reached the after_request layer.
+    #
+    # Deliberately not asserting on a route that reaches a handler. Those open
+    # real sockets here -- Postgres or DuckDB depending on the route, and
+    # /health both -- and still answer, so a weak assertion passes while the
+    # connection is attempted: a 500 satisfies "not 401", and a 503 carries
+    # the CORS header just as well.
+    denied = client.put("/config", base_url=external, headers=ui)
+    assert denied.status_code == 403
+    assert denied.headers["Access-Control-Allow-Origin"] == origin
+
+
 def test_config_internal_port_matches_a_port_the_dockerfile_binds(
     monkeypatch, reloaded_gateway
 ) -> None:

@@ -54,6 +54,24 @@ class Config:
     # CORTEX_EXTERNAL_PORT was a knob that silently did nothing.
     internal_port: int = _get_int_env("CORTEX_INTERNAL_PORT", "8080")
 
+    # A SECOND, SCOPED token for the browser extension, because api_token is
+    # omnipotent and this one lives in chrome.storage. With api_token a caller
+    # can PUT /config -- rewriting every triage rule in one request -- delete
+    # mappings, refresh the Gmail OAuth credential, and read a server
+    # filesystem path out of /oauth/status. Extension storage is readable by
+    # anything with the browser profile and by any extension holding
+    # `management` or `debugger` permission, so the UI gets a credential that
+    # is accepted on UI_ALLOWED routes only; everything else is 403.
+    #
+    # Unset means no scoped access, which is the safe default: the UI simply
+    # cannot authenticate.
+    ui_token: str = os.environ.get("CORTEX_UI_TOKEN", "")
+    # Exact browser origins allowed to make cross-origin calls, comma
+    # separated, e.g. chrome-extension://<id>. No default and never "*": a
+    # wildcard here would let any page in any browser read the whole API with
+    # a token the user has already stored.
+    ui_origins: str = os.environ.get("CORTEX_UI_ORIGINS", "")
+
     # Logging
     log_level: str = os.environ.get("LOG_LEVEL", "INFO")
 
