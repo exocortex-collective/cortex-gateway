@@ -28,4 +28,4 @@ ENV UV_CACHE_DIR=/home/appuser/.cache/uv
 EXPOSE 8080 8098 8001
 
 # Run with gunicorn (single worker to avoid metrics port conflict)
-CMD ["uv", "run", "gunicorn", "-w", "1", "-b", "0.0.0.0:8080", "-b", "0.0.0.0:8098", "gateway.app:create_app()"]
+CMD ["/app/.venv/bin/gunicorn", "-w", "1", "-b", "0.0.0.0:8080", "-b", "0.0.0.0:8098", "gateway.app:create_app()"]
