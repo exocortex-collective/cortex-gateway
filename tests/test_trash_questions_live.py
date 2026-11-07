@@ -307,7 +307,12 @@ def sender_q(conn: Any) -> Any:
             " VALUES (1, 'h', true, 'test')"
         )
         cur.execute("ALTER TABLE emails_parsed ADD COLUMN from_addr TEXT")
-        cur.execute("CREATE TABLE emails_raw (id BIGSERIAL, gmail_id TEXT)")
+        cur.execute("CREATE TABLE emails_raw (id BIGSERIAL, gmail_id TEXT, label_ids TEXT[])")
+        cur.execute("CREATE TABLE gmail_labels (id TEXT, name TEXT)")
+        cur.execute(
+            "INSERT INTO gmail_labels VALUES ('Label_1', 'Cortex/Commercial'),"
+            " ('Label_2', 'Cortex/Commercial/Retail'), ('Label_3', 'Family')"
+        )
         cur.execute(
             "INSERT INTO emails_parsed VALUES ('s1', 'Hi', now(), 's@x.com'),"
             " ('s2', 'Hi 2', now(), 's@x.com'), ('s3', 'Hi 3', now(), 's@x.com')"
@@ -542,3 +547,99 @@ def test_later_needs_an_open_question(client: FlaskClient, conn: Any) -> None:
         client.post("/triage/questions/q-b/answer", json={"scope": "later"}, headers=BY).status_code
         == 404
     )
+
+
+# --- GET /labels and label checks on answers ---------------------------------
+
+
+@pytest.fixture
+def labels_client(sender_q: Any) -> FlaskClient:
+    from gateway.blueprints.labels import labels_bp
+
+    with sender_q.cursor() as cur:
+        cur.execute(
+            "INSERT INTO emails_raw (gmail_id, label_ids) VALUES"
+            " ('m1', '{Label_2,INBOX}'), ('m2', '{Label_2}'), ('m3', '{Label_1}')"
+        )
+        cur.execute(
+            "INSERT INTO triage_email_mappings (mapping_type, email_address, label)"
+            " VALUES ('fallback', 'p@x.org', 'Social/Politics')"
+        )
+    sender_q.commit()
+    app = Flask("test")
+    app.register_blueprint(triage_bp, url_prefix="/triage")
+    app.register_blueprint(labels_bp, url_prefix="/labels")
+    return app.test_client()
+
+
+def test_labels_lists_the_managed_tree_with_counts(labels_client: FlaskClient) -> None:
+    body = labels_client.get("/labels").get_json()
+    assert body["prefix"] == "Cortex"
+    assert body["total"] == len(body["labels"]) == 3
+    assert body["labels"] == [
+        {
+            "name": "Cortex/Commercial",
+            "id": "Label_1",
+            "parent": "Cortex",
+            "messages": 1,
+            "applied": True,
+        },
+        {
+            "name": "Cortex/Commercial/Retail",
+            "id": "Label_2",
+            "parent": "Cortex/Commercial",
+            "messages": 2,
+            "applied": True,
+        },
+        # named by a live mapping, not yet in Gmail; "Family" is outside the tree
+        {
+            "name": "Cortex/Social/Politics",
+            "id": None,
+            "parent": "Cortex/Social",
+            "messages": 0,
+            "applied": True,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "Cortex/ News",
+        "News ",
+        " News",
+        "A//B",
+        "/News",
+        "News/",
+        "Commercial/Retail/",  # trailing slash under a label that exists
+        "Cortex/",
+        "Comercial/Retail",  # typo: no such parent
+    ],
+)
+def test_a_malformed_or_orphan_label_is_refused(
+    labels_client: FlaskClient, sender_q: Any, label: str
+) -> None:
+    r = _answer(labels_client, {"scope": "sender", "label": label})
+    assert r.status_code == 400, label
+    assert r.get_json()["error"]
+    assert _rows(
+        sender_q, "SELECT count(*) FROM triage_email_mappings WHERE email_address = 's@x.com'"
+    ) == [(0,)]
+
+
+@pytest.mark.parametrize(
+    ("label", "stored"),
+    [
+        ("Cortex/Commercial/Retail", "Commercial/Retail"),  # exists in Gmail
+        ("Commercial/Coupons", "Commercial/Coupons"),  # new, parent exists
+        ("Social/Politics/Local", "Social/Politics/Local"),  # parent known from a mapping
+        ("Politics", "Politics"),  # new directly under the prefix
+    ],
+)
+def test_a_known_label_or_a_child_of_one_is_accepted(
+    labels_client: FlaskClient, sender_q: Any, label: str, stored: str
+) -> None:
+    assert _answer(labels_client, {"scope": "sender", "label": label}).status_code == 200
+    assert _rows(
+        sender_q, "SELECT label FROM triage_email_mappings WHERE email_address = 's@x.com'"
+    ) == [(stored,)]

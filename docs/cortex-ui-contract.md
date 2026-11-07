@@ -207,3 +207,19 @@ Devon wants to put off a question he isn't ready to answer, without `ignore`, wh
   - It works on every kind. 404 if the id is unknown or already answered.
 - **`GET /triage/questions?status=open`** leaves snoozed questions out until `snoozed_until` passes, then lists them again. `total` counts only the listed questions. A new top-level field, **`snoozed`**, counts the open questions currently hidden.
 - A snoozed question is still open: it can be answered with any scope at any time, and a second `later` restarts the 7 days.
+
+---
+
+## v1.4: label browser (cortex-kaij)
+
+Devon mistyped some labels in the card's free-text box, so the card picks labels from the existing tree instead.
+
+- **`GET /labels`** (allowed for `CORTEX_UI_TOKEN`) returns `{"prefix":"Cortex","total":N,"labels":[{"name","id","parent","messages","applied"}]}`, sorted by name.
+  - Only the `Cortex/` tree is listed. The labeling worker applies nothing outside it, so `applied` is always `true` here.
+  - `parent` is the name minus its last segment; a top-level label's parent is `"Cortex"`.
+  - `messages` counts the stored emails carrying the label.
+  - A label a live mapping names that Gmail hasn't synced yet appears with `"id": null` and `"messages": 0`.
+- **The answer endpoint now checks `label`** on `scope:"sender"` and returns **400** with the reason in `error` when the label is:
+  - **malformed:** an empty part, a leading or trailing slash, or spaces around any part;
+  - **an orphan:** a new label whose parent doesn't exist, which is how a typo becomes a new branch.
+- **Accepted:** any existing label; a new label directly under an existing one (create a sub-label); or a new label directly under `Cortex`. The label may be sent with or without the `Cortex/` prefix.
