@@ -565,6 +565,11 @@ def labels_client(sender_q: Any) -> FlaskClient:
             "INSERT INTO triage_email_mappings (mapping_type, email_address, label)"
             " VALUES ('fallback', 'p@x.org', 'Social/Politics')"
         )
+        cur.execute(  # soft-deleted, so not a known label
+            "INSERT INTO triage_email_mappings"
+            " (mapping_type, email_address, label, deleted_at)"
+            " VALUES ('fallback', 'gone@x.org', 'Gone/Away', now())"
+        )
     sender_q.commit()
     app = Flask("test")
     app.register_blueprint(triage_bp, url_prefix="/triage")
@@ -643,3 +648,17 @@ def test_a_known_label_or_a_child_of_one_is_accepted(
     assert _rows(
         sender_q, "SELECT label FROM triage_email_mappings WHERE email_address = 's@x.com'"
     ) == [(stored,)]
+
+
+def test_the_tree_follows_the_configured_prefix(labels_client: FlaskClient, sender_q: Any) -> None:
+    with sender_q.cursor() as cur:
+        cur.execute("UPDATE triage_config_versions SET label_prefix = 'Mail'")
+        cur.execute("INSERT INTO gmail_labels VALUES ('Label_9', 'Mail/Bills')")
+    sender_q.commit()
+    body = labels_client.get("/labels").get_json()
+    assert body["prefix"] == "Mail"
+    assert [x["name"] for x in body["labels"]] == ["Mail/Bills", "Mail/Social/Politics"]
+    assert _answer(labels_client, {"scope": "sender", "label": "Mail/Bills"}).status_code == 200
+    assert _rows(
+        sender_q, "SELECT label FROM triage_email_mappings WHERE email_address = 's@x.com'"
+    ) == [("Bills",)]
