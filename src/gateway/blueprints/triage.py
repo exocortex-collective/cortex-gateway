@@ -1,5 +1,6 @@
 """Triage-related API endpoints."""
 
+import json
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -7,6 +8,7 @@ from typing import Any
 from cortex_utils.logging import get_logger
 from flask import Blueprint, jsonify, request
 
+from gateway.blueprints.mappings import MAPPING_CHANGE_REPROCESS_PRIORITY, create_mapping
 from gateway.services import postgres
 from gateway.services.postgres import ConnectionContext
 
@@ -403,9 +405,15 @@ TRASH_ANSWERS = {
 }
 
 
+# Questions the triage worker generates about a sender (cortex-kaij.4). The
+# answer writes a mapping, so one answer settles all of that sender's mail.
+SENDER_KINDS = ("uncategorized_sender", "low_confidence")
+NO_PROPOSAL = {"label": None, "archive": False, "mark_read": False}
+
+
 @triage_bp.route("/questions")
 def list_questions():
-    """Open questions, largest first. Only kind trash_sender exists so far."""
+    """Open questions, largest first."""
     status = request.args.get("status", "open")
     try:
         limit = min(int(request.args.get("limit", 50)), 200)
@@ -417,12 +425,13 @@ def list_questions():
     rows = postgres.execute_query(
         """
         SELECT q.id, q.kind, q.status, q.asked_at, q.from_addr,
-               COUNT(t.gmail_id) AS volume,
-               COALESCE(json_agg(json_build_object(
+               COALESCE(q.volume, COUNT(t.gmail_id)) AS volume,
+               COALESCE(q.sample::json, json_agg(json_build_object(
                    'gmail_id', t.gmail_id, 'subject', p.subject,
                    'date_header', p.date_header)
                  ORDER BY t.queued_at DESC) FILTER (WHERE t.gmail_id IS NOT NULL),
                  '[]') AS sample,
+               q.proposed, q.llm_category, q.confidence, q.reasoning,
                COUNT(*) OVER () AS total
         FROM triage_questions q
         LEFT JOIN triage_trash_queue t
@@ -444,10 +453,10 @@ def list_questions():
             "from_addr": r["from_addr"],
             "volume": r["volume"],
             "sample": r["sample"][:5],
-            "proposed": None,
-            "llm_category": None,
-            "confidence": None,
-            "reasoning": None,
+            "proposed": r["proposed"] or (NO_PROPOSAL if r["kind"] in SENDER_KINDS else None),
+            "llm_category": r["llm_category"],
+            "confidence": r["confidence"],
+            "reasoning": r["reasoning"],
         }
         for r in rows
     ]
@@ -457,11 +466,12 @@ def list_questions():
 
 @triage_bp.route("/questions/<question_id>/answer", methods=["POST"])
 def answer_question(question_id: str) -> Any:
-    """Answer a trash_sender question: scope sender, once or ignore."""
+    """Answer a question: scope sender, once or ignore."""
     created_by = request.headers.get("X-Created-By")
     if not created_by:
         return jsonify({"error": "Missing X-Created-By header"}), 400
-    scope = (request.get_json(silent=True) or {}).get("scope")
+    body = request.get_json(silent=True) or {}
+    scope = body.get("scope")
     if scope not in TRASH_ANSWERS:
         return jsonify({"error": f"scope must be one of {sorted(TRASH_ANSWERS)}"}), 400
     decision, row_status = TRASH_ANSWERS[scope]
@@ -476,9 +486,11 @@ def answer_question(question_id: str) -> Any:
             (question_id,),
         )
         row = cur.fetchone()
+        if row is not None and row[0] in SENDER_KINDS:
+            return _answer_sender_question(conn, cur, question_id, row[1], body, created_by)
         if row is None or row[0] != "trash_sender":
             conn.rollback()
-            return jsonify({"error": "no open trash_sender question with that id"}), 404
+            return jsonify({"error": "no open question with that id"}), 404
         from_addr = row[1]
         if decision:
             cur.execute(
@@ -513,3 +525,93 @@ def answer_question(question_id: str) -> Any:
         conn.commit()
     logger.info(f"Trash question {question_id} ({from_addr}) answered {scope}")
     return jsonify({"answered": question_id, "scope": scope, "rows_enqueued": len(released)})
+
+
+def _answer_sender_question(
+    conn: Any, cur: Any, question_id: str, from_addr: str, body: dict[str, Any], created_by: str
+) -> Any:
+    """sender writes a mapping, once re-triages the sampled mail, ignore closes.
+
+    Runs under the trash gate lock with the question row locked, so the triage
+    worker's generator cannot re-open it.
+    """
+    scope = body["scope"]
+    answer: dict[str, Any] = {"scope": scope, "by": created_by}
+    mapping_id = None
+    rows_enqueued = 0
+    if scope == "sender":
+        mapping = _mapping_from_answer(cur, body)
+        if isinstance(mapping, str):
+            conn.rollback()
+            return jsonify({"error": mapping}), 400
+        mapping_type, label, archive, mark_read = mapping
+        created = create_mapping(
+            cur, mapping_type, from_addr, label, archive, mark_read, created_by
+        )
+        if created is None:
+            conn.rollback()
+            return jsonify({"error": "a mapping already exists for this sender"}), 409
+        mapping_id, rows_enqueued = created
+        answer |= {"label": label, "mapping_id": mapping_id}
+    elif scope == "once":
+        cur.execute(
+            """
+            INSERT INTO queue (queue_name, payload, priority, status)
+            SELECT DISTINCT ON (er.gmail_id) 'triage',
+                   jsonb_build_object('email_id', er.id, 'gmail_id', er.gmail_id,
+                                      'rerun', true, 'reason', 'question_once'),
+                   %s, 'pending'
+            FROM triage_questions q
+            CROSS JOIN LATERAL jsonb_array_elements(q.sample) AS s
+            JOIN emails_raw er ON er.gmail_id = s->>'gmail_id'
+            WHERE q.id = %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM queue j
+                  WHERE j.queue_name = 'triage'
+                    AND j.payload->>'gmail_id' = er.gmail_id
+                    AND j.status IN ('pending', 'processing'))
+            """,
+            (MAPPING_CHANGE_REPROCESS_PRIORITY, question_id),
+        )
+        rows_enqueued = cur.rowcount
+    cur.execute(
+        "UPDATE triage_questions SET status = 'answered', answered_at = now(),"
+        " answer = %s::jsonb WHERE id = %s",
+        (json.dumps(answer), question_id),
+    )
+    conn.commit()
+    logger.info(f"Question {question_id} ({from_addr}) answered {scope}")
+    return jsonify(
+        {
+            "answered": question_id,
+            "scope": scope,
+            "mapping_id": mapping_id,
+            "rows_enqueued": rows_enqueued,
+        }
+    )
+
+
+def _mapping_from_answer(
+    cur: Any, body: dict[str, Any]
+) -> tuple[str, str, bool | None, bool | None] | str:
+    """(mapping_type, label, archive, mark_read) for a scope:sender answer, or
+    the reason it is invalid. The label is Devon's choice, not the model's."""
+    label = body.get("label")
+    if not isinstance(label, str) or not label.strip():
+        return "label is required when scope is sender"
+    mapping_type = body.get("mapping_type", "fallback")
+    if mapping_type not in ("fallback", "priority"):
+        return "mapping_type must be 'fallback' or 'priority'"
+    flags = {k: body.get(k) for k in ("archive", "mark_read")}
+    if any(v is not None and not isinstance(v, bool) for v in flags.values()):
+        return "archive and mark_read must be booleans or null"
+    # Mappings store labels unprefixed and the matcher adds the prefix, so a
+    # label sent as the UI shows it ("Cortex/X") would become Cortex/Cortex/X.
+    cur.execute("SELECT label_prefix FROM triage_config_versions WHERE is_active")
+    row = cur.fetchone()
+    label = label.strip()
+    if row and row[0] and label.startswith(f"{row[0]}/"):
+        label = label[len(row[0]) + 1 :].strip()
+    if not label:
+        return "label is required when scope is sender"
+    return mapping_type, label, flags["archive"], flags["mark_read"]

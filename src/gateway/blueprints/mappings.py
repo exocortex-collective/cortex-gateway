@@ -159,29 +159,13 @@ def add_mapping() -> Response | tuple[Response, int]:
 
     try:
         with ConnectionContext() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                # Insert mapping, handling conflicts atomically
-                cursor.execute(
-                    """
-                    INSERT INTO triage_email_mappings (
-                        mapping_type, email_address, label, archive, mark_read,
-                        created_by, created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
-                    ON CONFLICT (mapping_type, email_address) WHERE deleted_at IS NULL
-                    DO NOTHING
-                    RETURNING id
-                    """,
-                    (mapping_type, email, label, archive, mark_read, created_by),
+            with conn.cursor() as cursor:
+                created = create_mapping(
+                    cursor, mapping_type, email, label, archive, mark_read, created_by
                 )
-
-                result = cursor.fetchone()
-                if not result:
+                if created is None:
                     return jsonify({"error": "Mapping for this email and type already exists"}), 409
-
-                mapping_id = result["id"]
-
-                # Trigger side-effects for mapping change
-                rows_enqueued = _trigger_mapping_change_side_effects(cursor, email)
+                mapping_id, rows_enqueued = created
 
             conn.commit()
 
@@ -460,6 +444,38 @@ def get_mapping_history(email_address: str) -> Response | tuple[Response, int]:
             "total": total,
         }
     )
+
+
+def create_mapping(
+    cursor: Any,
+    mapping_type: str,
+    email: str,
+    label: str,
+    archive: bool | None,
+    mark_read: bool | None,
+    created_by: str,
+) -> tuple[int, int] | None:
+    """Insert a mapping and trigger its side effects, uncommitted.
+
+    Returns (mapping_id, rows_enqueued), or None if one already exists. Also
+    used by the triage question answer route.
+    """
+    cursor.execute(
+        """
+        INSERT INTO triage_email_mappings (
+            mapping_type, email_address, label, archive, mark_read,
+            created_by, created_at, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+        ON CONFLICT (mapping_type, email_address) WHERE deleted_at IS NULL
+        DO NOTHING
+        RETURNING id
+        """,
+        (mapping_type, email, label, archive, mark_read, created_by),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return row[0], _trigger_mapping_change_side_effects(cursor, email)
 
 
 def _trigger_mapping_change_side_effects(cursor: Any, email_address: str) -> int:
