@@ -17,9 +17,10 @@ logger = get_logger()
 
 mappings_bp = Blueprint("mappings", __name__)
 
-# Priority for re-processing emails when mappings change
-# Lower than default (0) and backfill (-100) to avoid blocking real-time processing
-MAPPING_CHANGE_REPROCESS_PRIORITY = -200
+# Re-triage Devon starts (a mapping change or a question answer): below live
+# mail (0) so it never delays it, above backfill (-100) so his answer shows up
+# within minutes instead of after the whole backfill drains.
+MAPPING_CHANGE_REPROCESS_PRIORITY = -50
 
 # Delay before the re-enqueued jobs become claimable. A mapping change enqueues
 # the sender's mail AND signals the triage worker to reload mappings in one

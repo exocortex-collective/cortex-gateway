@@ -110,7 +110,7 @@ Per-email questions would be 38,442 items. Per-sender at ≥10 is 617, each answ
 ```json
 {"scope":"sender","label":"Cortex/Commercial/Newsletter","archive":true,"mark_read":true,"mapping_type":"fallback"}
 ```
-- `scope:"sender"` → performs the existing **`POST /mappings`** write. That is the code-enforced precedent: transactional, audited to `triage_email_mappings_history`, inserts a `worker_signals` reload, and re-enqueues that sender's mail at priority −200 so it applies retroactively.
+- `scope:"sender"` → performs the existing **`POST /mappings`** write. That is the code-enforced precedent: transactional, audited to `triage_email_mappings_history`, inserts a `worker_signals` reload, and re-enqueues that sender's mail at priority −50 (above backfill, below live mail; was −200 until 2026-11-07) so it applies retroactively.
 - `scope:"once"` → re-enqueues only the sampled `gmail_id`s, writes no mapping.
 - `scope:"ignore"` → closes the question, writes nothing, suppresses it from `status=open`.
 
