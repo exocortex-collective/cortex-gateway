@@ -409,6 +409,10 @@ TRASH_ANSWERS = {
 # answer writes a mapping, so one answer settles all of that sender's mail.
 SENDER_KINDS = ("uncategorized_sender", "low_confidence")
 NO_PROPOSAL = {"label": None, "archive": False, "mark_read": False}
+# The triage worker's refresh never overwrites `answer`, so a snooze kept there
+# survives it.
+SNOOZE_DAYS = 7
+SNOOZED = "(q.answer->>'snoozed_until')::timestamptz > now()"
 
 
 @triage_bp.route("/questions")
@@ -423,7 +427,7 @@ def list_questions():
     if limit < 0 or not 0 <= offset <= 1_000_000:
         return jsonify({"error": "limit and offset must be integers in range"}), 400
     rows = postgres.execute_query(
-        """
+        f"""
         SELECT q.id, q.kind, q.status, q.asked_at, q.from_addr,
                COALESCE(q.volume, COUNT(t.gmail_id)) AS volume,
                COALESCE(q.sample::json, json_agg(json_build_object(
@@ -437,7 +441,7 @@ def list_questions():
         LEFT JOIN triage_trash_queue t
           ON t.from_addr = q.from_addr AND t.status = 'pending'
         LEFT JOIN emails_parsed p ON p.gmail_id = t.gmail_id
-        WHERE q.status = %s
+        WHERE q.status = %s AND NOT COALESCE({SNOOZED}, false)
         GROUP BY q.id
         ORDER BY volume DESC, q.asked_at
         LIMIT %s OFFSET %s
@@ -461,19 +465,34 @@ def list_questions():
         for r in rows
     ]
     total = rows[0]["total"] if rows else 0
-    return jsonify({"questions": questions, "limit": limit, "offset": offset, "total": total})
+    snoozed = postgres.execute_query(
+        f"SELECT COUNT(*) AS n FROM triage_questions q WHERE q.status = %s AND {SNOOZED}",
+        (status,),
+    )[0]["n"]
+    return jsonify(
+        {
+            "questions": questions,
+            "limit": limit,
+            "offset": offset,
+            "total": total,
+            "snoozed": snoozed,
+        }
+    )
 
 
 @triage_bp.route("/questions/<question_id>/answer", methods=["POST"])
 def answer_question(question_id: str) -> Any:
-    """Answer a question: scope sender, once or ignore."""
+    """Answer a question: scope sender, once, ignore or later."""
     created_by = request.headers.get("X-Created-By")
     if not created_by:
         return jsonify({"error": "Missing X-Created-By header"}), 400
     body = request.get_json(silent=True) or {}
     scope = body.get("scope")
+    if scope == "later":
+        return _snooze_question(question_id, created_by)
     if scope not in TRASH_ANSWERS:
-        return jsonify({"error": f"scope must be one of {sorted(TRASH_ANSWERS)}"}), 400
+        scopes = sorted([*TRASH_ANSWERS, "later"])
+        return jsonify({"error": f"scope must be one of {scopes}"}), 400
     decision, row_status = TRASH_ANSWERS[scope]
 
     with ConnectionContext() as conn, conn.cursor() as cur:
@@ -615,3 +634,30 @@ def _mapping_from_answer(
     if not label:
         return "label is required when scope is sender"
     return mapping_type, label, flags["archive"], flags["mark_read"]
+
+
+def _snooze_question(question_id: str, created_by: str) -> Any:
+    with ConnectionContext() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE triage_questions SET answer = jsonb_build_object("
+            " 'scope', 'later', 'by', %s::text,"
+            " 'snoozed_until', now() + make_interval(days => %s))"
+            " WHERE id = %s AND status = 'open'"
+            " RETURNING (answer->>'snoozed_until')::timestamptz",
+            (created_by, SNOOZE_DAYS, question_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            conn.rollback()
+            return jsonify({"error": "no open question with that id"}), 404
+        conn.commit()
+    logger.info(f"Question {question_id} snoozed until {row[0].isoformat()}")
+    return jsonify(
+        {
+            "answered": question_id,
+            "scope": "later",
+            "snoozed_until": row[0].isoformat(),
+            "mapping_id": None,
+            "rows_enqueued": 0,
+        }
+    )
