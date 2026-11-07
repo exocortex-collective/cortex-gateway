@@ -486,26 +486,31 @@ def test_later_snoozes_without_writing_anything(client: FlaskClient, sender_q: A
     )
     days = _rows(
         sender_q,
-        "SELECT status, round(extract(epoch FROM (answer->>'snoozed_until')::timestamptz"
-        " - now()) / 86400) FROM triage_questions WHERE id = 'q-s'",
+        "SELECT status, answer->>'by', round(extract(epoch FROM"
+        " (answer->>'snoozed_until')::timestamptz - now()) / 86400)"
+        " FROM triage_questions WHERE id = 'q-s'",
     )
-    assert days == [("open", 7)]
+    assert days == [("open", "test@trash", 7)]
     assert _rows(sender_q, "SELECT count(*) FROM triage_email_mappings") == [(0,)]
     assert _triage_jobs(sender_q) == []
     ids, total, snoozed = _open_ids(client)
     assert "q-s" not in ids and snoozed == 1 and total == len(ids)
 
 
-def test_a_snooze_ends_and_the_question_returns(client: FlaskClient, sender_q: Any) -> None:
+@pytest.mark.parametrize(("offset", "hidden"), [("-1 minute", False), ("1 minute", True)])
+def test_a_snooze_ends_exactly_when_it_says(
+    client: FlaskClient, sender_q: Any, offset: str, hidden: bool
+) -> None:
     _answer(client, {"scope": "later"})
     with sender_q.cursor() as cur:
         cur.execute(
             "UPDATE triage_questions SET answer = jsonb_set(answer, '{snoozed_until}',"
-            " to_jsonb(now() - interval '1 minute')) WHERE id = 'q-s'"
+            " to_jsonb(now() + %s::interval)) WHERE id = 'q-s'",
+            (offset,),
         )
     sender_q.commit()
     ids, _, snoozed = _open_ids(client)
-    assert "q-s" in ids and snoozed == 0
+    assert ("q-s" not in ids) is hidden and snoozed == int(hidden)
 
 
 def test_a_snoozed_question_can_still_be_answered(client: FlaskClient, sender_q: Any) -> None:

@@ -409,8 +409,8 @@ TRASH_ANSWERS = {
 # answer writes a mapping, so one answer settles all of that sender's mail.
 SENDER_KINDS = ("uncategorized_sender", "low_confidence")
 NO_PROPOSAL = {"label": None, "archive": False, "mark_read": False}
-# scope "later": the question stays open but is left out of the open list until
-# then. Kept in `answer`, which the triage worker's refresh never overwrites.
+# The triage worker's refresh never overwrites `answer`, so a snooze kept there
+# survives it.
 SNOOZE_DAYS = 7
 SNOOZED = "(q.answer->>'snoozed_until')::timestamptz > now()"
 
@@ -637,8 +637,6 @@ def _mapping_from_answer(
 
 
 def _snooze_question(question_id: str, created_by: str) -> Any:
-    """Leave the question open, out of the open list for SNOOZE_DAYS; change
-    nothing else."""
     with ConnectionContext() as conn, conn.cursor() as cur:
         cur.execute(
             "UPDATE triage_questions SET answer = jsonb_build_object("
