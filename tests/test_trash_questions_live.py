@@ -6,6 +6,7 @@ Skipped unless CORTEX_TEST_DSN points at a throwaway Postgres; CI starts one.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import uuid
@@ -235,9 +236,9 @@ def test_a_bad_page_is_a_400(client: FlaskClient, query: str) -> None:
     assert client.get(f"/triage/questions?{query}").status_code == 400
 
 
-def test_another_kind_of_question_is_not_answered_here(client: FlaskClient, conn: Any) -> None:
-    _ask(conn, "q-u", "u@x.com", 0, kind="uncategorized_sender")
-    r = client.post("/triage/questions/q-u/answer", json={"scope": "sender"}, headers=BY)
+def test_an_unknown_kind_of_question_is_not_answered_here(client: FlaskClient, conn: Any) -> None:
+    _ask(conn, "q-u", "u@x.com", 0, kind="something_new")
+    r = client.post("/triage/questions/q-u/answer", json={"scope": "ignore"}, headers=BY)
     assert r.status_code == 404
     assert _rows(conn, "SELECT status FROM triage_questions WHERE id = 'q-u'") == [("open",)]
 
@@ -289,3 +290,177 @@ def test_equal_volume_asks_oldest_first(client: FlaskClient, conn: Any) -> None:
     conn.commit()
     ids = [q["id"] for q in client.get("/triage/questions").get_json()["questions"]]
     assert ids == ["q-b", "q-a"]
+
+
+# --- uncategorized_sender / low_confidence (cortex-kaij.4) ---------------------
+
+CONFIG_SCHEMA = (Path(__file__).parent / "fixtures" / "triage_config_schema.sql").read_text()
+
+
+@pytest.fixture
+def sender_q(conn: Any) -> Any:
+    """An open uncategorized_sender question for s@x.com with two sampled mails."""
+    with conn.cursor() as cur:
+        cur.execute(CONFIG_SCHEMA)
+        cur.execute(
+            "INSERT INTO triage_config_versions (version, config_hash, is_active, created_by)"
+            " VALUES (1, 'h', true, 'test')"
+        )
+        cur.execute("ALTER TABLE emails_parsed ADD COLUMN from_addr TEXT")
+        cur.execute("CREATE TABLE emails_raw (id BIGSERIAL, gmail_id TEXT)")
+        cur.execute(
+            "INSERT INTO emails_parsed VALUES ('s1', 'Hi', now(), 's@x.com'),"
+            " ('s2', 'Hi 2', now(), 's@x.com'), ('s3', 'Hi 3', now(), 's@x.com')"
+        )
+        cur.execute("INSERT INTO emails_raw (gmail_id) VALUES ('s1'), ('s2'), ('s3')")
+        cur.execute(
+            "INSERT INTO triage_questions (id, kind, from_addr, volume, sample, proposed,"
+            " llm_category, confidence, reasoning) VALUES ('q-s', 'uncategorized_sender',"
+            " 's@x.com', 3, %s, %s, 'news', 0.4, 'looks like a newsletter')",
+            (
+                json.dumps([{"gmail_id": "s1"}, {"gmail_id": "s2"}]),
+                json.dumps({"label": "Cortex/News", "archive": True, "mark_read": False}),
+            ),
+        )
+    conn.commit()
+    return conn
+
+
+def _answer(client: FlaskClient, body: dict[str, Any]) -> Any:
+    return client.post("/triage/questions/q-s/answer", json=body, headers=BY)
+
+
+def _triage_jobs(conn: Any) -> list[tuple]:
+    return _rows(conn, "SELECT payload->>'gmail_id' FROM queue WHERE queue_name = 'triage'")
+
+
+def test_a_sender_question_lists_its_stored_fields(client: FlaskClient, sender_q: Any) -> None:
+    q = next(q for q in client.get("/triage/questions").get_json()["questions"] if q["id"] == "q-s")
+    assert (q["kind"], q["from_addr"], q["volume"]) == ("uncategorized_sender", "s@x.com", 3)
+    assert [s["gmail_id"] for s in q["sample"]] == ["s1", "s2"]
+    assert q["proposed"] == {"label": "Cortex/News", "archive": True, "mark_read": False}
+    assert (q["llm_category"], q["reasoning"]) == ("news", "looks like a newsletter")
+    assert q["confidence"] == pytest.approx(0.4)
+
+
+def test_scope_sender_writes_the_mapping_unprefixed(client: FlaskClient, sender_q: Any) -> None:
+    r = _answer(
+        client,
+        {
+            "scope": "sender",
+            "label": "Cortex/Commercial/Newsletter",
+            "archive": True,
+            "mark_read": True,
+            "mapping_type": "fallback",
+        },
+    )
+    assert r.status_code == 200
+    body = r.get_json()
+    assert (body["answered"], body["scope"], body["rows_enqueued"]) == ("q-s", "sender", 3)
+    assert _rows(
+        sender_q,
+        "SELECT id, mapping_type, email_address, label, archive, mark_read, created_by"
+        " FROM triage_email_mappings",
+    ) == [
+        (
+            body["mapping_id"],
+            "fallback",
+            "s@x.com",
+            "Commercial/Newsletter",
+            True,
+            True,
+            "test@trash",
+        )
+    ]
+    assert _triage_jobs(sender_q) == [("s1",), ("s2",), ("s3",)]
+    assert _rows(sender_q, "SELECT signal_type FROM worker_signals") == [("mappings_reload",)]
+    assert _rows(
+        sender_q, "SELECT status, answer->>'label' FROM triage_questions WHERE id = 'q-s'"
+    ) == [("answered", "Commercial/Newsletter")]
+
+
+def test_scope_sender_needs_a_label_and_valid_fields(client: FlaskClient, sender_q: Any) -> None:
+    for body in (
+        {"scope": "sender"},
+        {"scope": "sender", "label": " "},
+        {"scope": "sender", "label": "X", "mapping_type": "other"},
+        {"scope": "sender", "label": "X", "archive": "yes"},
+        {"scope": "sender", "label": "Cortex/ "},
+    ):
+        assert _answer(client, body).status_code == 400, body
+    assert _rows(sender_q, "SELECT count(*) FROM triage_email_mappings") == [(0,)]
+    assert _rows(sender_q, "SELECT status FROM triage_questions WHERE id = 'q-s'") == [("open",)]
+
+
+def test_an_existing_mapping_is_a_409_and_the_question_stays_open(
+    client: FlaskClient, sender_q: Any
+) -> None:
+    with sender_q.cursor() as cur:
+        cur.execute(
+            "INSERT INTO triage_email_mappings (mapping_type, email_address, label)"
+            " VALUES ('fallback', 's@x.com', 'Family')"
+        )
+    sender_q.commit()
+    assert _answer(client, {"scope": "sender", "label": "X"}).status_code == 409
+    assert _rows(sender_q, "SELECT status FROM triage_questions WHERE id = 'q-s'") == [("open",)]
+    assert _triage_jobs(sender_q) == []
+    # the 409 released its locks: the same question can still be answered
+    assert _answer(client, {"scope": "ignore"}).status_code == 200
+
+
+def test_an_unprefixed_label_is_stored_as_given(client: FlaskClient, sender_q: Any) -> None:
+    assert _answer(client, {"scope": "sender", "label": "Family"}).status_code == 200
+    assert _rows(sender_q, "SELECT label FROM triage_email_mappings") == [("Family",)]
+
+
+def test_scope_once_retriages_only_the_sample(client: FlaskClient, sender_q: Any) -> None:
+    with sender_q.cursor() as cur:  # s1 is already waiting to be triaged
+        cur.execute(
+            "INSERT INTO queue (queue_name, payload, status)"
+            " VALUES ('triage', '{\"gmail_id\": \"s1\"}', 'pending')"
+        )
+    sender_q.commit()
+    r = _answer(client, {"scope": "once"})
+    assert r.status_code == 200
+    assert r.get_json()["rows_enqueued"] == 1
+    assert _triage_jobs(sender_q) == [("s1",), ("s2",)]
+    assert _rows(sender_q, "SELECT count(*) FROM triage_email_mappings") == [(0,)]
+
+
+def test_a_low_confidence_question_answers_the_same_way(client: FlaskClient, sender_q: Any) -> None:
+    with sender_q.cursor() as cur:
+        cur.execute("UPDATE triage_questions SET kind = 'low_confidence' WHERE id = 'q-s'")
+    sender_q.commit()
+    r = _answer(client, {"scope": "sender", "label": "News", "mapping_type": "priority"})
+    assert r.status_code == 200
+    assert _rows(sender_q, "SELECT mapping_type, label FROM triage_email_mappings") == [
+        ("priority", "News")
+    ]
+
+
+def test_a_sender_question_without_a_proposal_lists_the_empty_one(
+    client: FlaskClient, sender_q: Any
+) -> None:
+    with sender_q.cursor() as cur:
+        cur.execute("UPDATE triage_questions SET proposed = NULL WHERE id = 'q-s'")
+    sender_q.commit()
+    questions = client.get("/triage/questions").get_json()["questions"]
+    by_id = {q["id"]: q["proposed"] for q in questions}
+    assert by_id["q-s"] == {"label": None, "archive": False, "mark_read": False}
+    assert by_id["q-a"] is None  # trash_sender keeps no proposal
+
+
+def test_scope_ignore_writes_nothing(client: FlaskClient, sender_q: Any) -> None:
+    r = _answer(client, {"scope": "ignore", "label": "ignored"})
+    assert r.get_json() == {
+        "answered": "q-s",
+        "scope": "ignore",
+        "mapping_id": None,
+        "rows_enqueued": 0,
+    }
+    assert _triage_jobs(sender_q) == []
+    assert _rows(sender_q, "SELECT count(*) FROM triage_email_mappings") == [(0,)]
+    assert _rows(
+        sender_q, "SELECT status, answer->>'scope' FROM triage_questions WHERE id = 'q-s'"
+    ) == [("answered", "ignore")]
+    assert _answer(client, {"scope": "ignore"}).status_code == 404

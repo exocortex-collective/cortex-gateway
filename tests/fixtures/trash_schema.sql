@@ -27,3 +27,11 @@ CREATE TABLE IF NOT EXISTS triage_questions (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_triage_questions_open
     ON triage_questions (kind, from_addr) WHERE status = 'open';
+-- Filled by triage.services.questions (cortex-kaij.4); NULL for trash_sender.
+ALTER TABLE triage_questions
+    ADD COLUMN IF NOT EXISTS volume INT,
+    ADD COLUMN IF NOT EXISTS sample JSONB,
+    ADD COLUMN IF NOT EXISTS proposed JSONB,
+    ADD COLUMN IF NOT EXISTS llm_category TEXT,
+    ADD COLUMN IF NOT EXISTS confidence REAL,
+    ADD COLUMN IF NOT EXISTS reasoning TEXT;
