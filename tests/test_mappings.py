@@ -35,3 +35,9 @@ def test_side_effects_enqueue_then_signal_reload() -> None:
     sqls = [c.args[0] for c in cur.execute.call_args_list]
     assert any("next_attempt_at" in s for s in sqls)  # the delayed re-enqueue
     assert any("worker_signals" in s and "mappings_reload" in s for s in sqls)
+
+
+def test_devon_started_retriage_outranks_backfill_but_not_live_mail() -> None:
+    """Live mail is 0 and backfill -100 (cortex CLAUDE.md); an answer Devon
+    gives must land before the backfill drains, without delaying live mail."""
+    assert -100 < MAPPING_CHANGE_REPROCESS_PRIORITY < 0
