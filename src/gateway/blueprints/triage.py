@@ -595,7 +595,7 @@ def _mapping_from_answer(
     cur: Any, body: dict[str, Any]
 ) -> tuple[str, str, bool | None, bool | None] | str:
     """(mapping_type, label, archive, mark_read) for a scope:sender answer, or
-    the reason it is invalid. The label is Devon's choice, not the model's."""
+    the reason it is invalid."""
     label = body.get("label")
     if not isinstance(label, str) or not label.strip():
         return "label is required when scope is sender"

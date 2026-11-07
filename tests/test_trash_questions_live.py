@@ -427,6 +427,29 @@ def test_scope_once_retriages_only_the_sample(client: FlaskClient, sender_q: Any
     assert _rows(sender_q, "SELECT count(*) FROM triage_email_mappings") == [(0,)]
 
 
+def test_a_low_confidence_question_answers_the_same_way(client: FlaskClient, sender_q: Any) -> None:
+    with sender_q.cursor() as cur:
+        cur.execute("UPDATE triage_questions SET kind = 'low_confidence' WHERE id = 'q-s'")
+    sender_q.commit()
+    r = _answer(client, {"scope": "sender", "label": "News", "mapping_type": "priority"})
+    assert r.status_code == 200
+    assert _rows(sender_q, "SELECT mapping_type, label FROM triage_email_mappings") == [
+        ("priority", "News")
+    ]
+
+
+def test_a_sender_question_without_a_proposal_lists_the_empty_one(
+    client: FlaskClient, sender_q: Any
+) -> None:
+    with sender_q.cursor() as cur:
+        cur.execute("UPDATE triage_questions SET proposed = NULL WHERE id = 'q-s'")
+    sender_q.commit()
+    questions = client.get("/triage/questions").get_json()["questions"]
+    by_id = {q["id"]: q["proposed"] for q in questions}
+    assert by_id["q-s"] == {"label": None, "archive": False, "mark_read": False}
+    assert by_id["q-a"] is None  # trash_sender keeps no proposal
+
+
 def test_scope_ignore_writes_nothing(client: FlaskClient, sender_q: Any) -> None:
     r = _answer(client, {"scope": "ignore", "label": "ignored"})
     assert r.get_json() == {

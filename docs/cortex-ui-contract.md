@@ -191,4 +191,4 @@ The triage worker opens the questions (`cortex-triage` `services/questions.py`, 
 3. **`reasoning` and `llm_category` are model text about outside mail.** They are stripped of control and format characters (including bidi overrides) and collapsed to one line, but they are still not trusted. Render them as text.
 4. **A sender is asked about once.** After any answer, including `ignore`, the generator never re-opens a question for that sender and kind. A question disappears unanswered if the sender gets a mapping some other way or drops below the volume bar.
 5. **`scope:"once"`** re-triages the question's sample, which is the 5 newest emails, not every email from the sender.
-6. **`low_confidence` is inert** until a rule records a confidence (see above). On Hades on 2026-11-07, 673 senders qualified for `uncategorized_sender`, covering 32,289 emails.
+6. **`low_confidence` is inert** until a rule records a confidence (§3.3). On Hades on 2026-11-07, 673 senders qualified for `uncategorized_sender`, covering 32,289 emails.
