@@ -408,6 +408,7 @@ class TestTheUiTokenIsScoped:
                 ("GET", "/triage/convergence/status"),
                 ("GET", "/config/versions"),
                 ("GET", "/mappings"),
+                ("GET", "/labels"),
                 ("POST", "/mappings"),
                 ("POST", "/triage/rerun"),
             }

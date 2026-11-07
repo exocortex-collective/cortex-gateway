@@ -3,6 +3,7 @@
 from gateway.blueprints.backfill import backfill_bp
 from gateway.blueprints.config import config_bp
 from gateway.blueprints.emails import emails_bp
+from gateway.blueprints.labels import labels_bp
 from gateway.blueprints.mappings import mappings_bp
 from gateway.blueprints.oauth import oauth_bp
 from gateway.blueprints.queue import queue_bp
@@ -13,6 +14,7 @@ __all__ = [
     "backfill_bp",
     "config_bp",
     "emails_bp",
+    "labels_bp",
     "mappings_bp",
     "oauth_bp",
     "queue_bp",

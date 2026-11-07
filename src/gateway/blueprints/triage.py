@@ -8,6 +8,7 @@ from typing import Any
 from cortex_utils.logging import get_logger
 from flask import Blueprint, jsonify, request
 
+from gateway.blueprints.labels import check_label
 from gateway.blueprints.mappings import MAPPING_CHANGE_REPROCESS_PRIORITY, create_mapping
 from gateway.services import postgres
 from gateway.services.postgres import ConnectionContext
@@ -624,15 +625,10 @@ def _mapping_from_answer(
     flags = {k: body.get(k) for k in ("archive", "mark_read")}
     if any(v is not None and not isinstance(v, bool) for v in flags.values()):
         return "archive and mark_read must be booleans or null"
-    # Mappings store labels unprefixed and the matcher adds the prefix, so a
-    # label sent as the UI shows it ("Cortex/X") would become Cortex/Cortex/X.
-    cur.execute("SELECT label_prefix FROM triage_config_versions WHERE is_active")
-    row = cur.fetchone()
-    label = label.strip()
-    if row and row[0] and label.startswith(f"{row[0]}/"):
-        label = label[len(row[0]) + 1 :].strip()
-    if not label:
-        return "label is required when scope is sender"
+    try:
+        label = check_label(cur, label)
+    except ValueError as e:
+        return str(e)
     return mapping_type, label, flags["archive"], flags["mark_read"]
 
 

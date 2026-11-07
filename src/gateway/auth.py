@@ -139,6 +139,7 @@ UI_ALLOWED_EXACT: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/triage/convergence/status"),
         ("GET", "/config/versions"),
         ("GET", "/mappings"),
+        ("GET", "/labels"),
         # The question-answer path writes a mapping, so the UI needs POST.
         # PUT and DELETE stay out: answering a question adds a precedent.
         ("POST", "/mappings"),
