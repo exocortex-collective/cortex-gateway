@@ -464,3 +464,76 @@ def test_scope_ignore_writes_nothing(client: FlaskClient, sender_q: Any) -> None
         sender_q, "SELECT status, answer->>'scope' FROM triage_questions WHERE id = 'q-s'"
     ) == [("answered", "ignore")]
     assert _answer(client, {"scope": "ignore"}).status_code == 404
+
+
+# --- scope "later" (gateway-b874) ------------------------------------------
+
+
+def _open_ids(client: FlaskClient) -> tuple[list[str], int, int]:
+    body = client.get("/triage/questions").get_json()
+    return [q["id"] for q in body["questions"]], body["total"], body["snoozed"]
+
+
+def test_later_snoozes_without_writing_anything(client: FlaskClient, sender_q: Any) -> None:
+    r = _answer(client, {"scope": "later"})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert (body["answered"], body["scope"], body["mapping_id"], body["rows_enqueued"]) == (
+        "q-s",
+        "later",
+        None,
+        0,
+    )
+    days = _rows(
+        sender_q,
+        "SELECT status, round(extract(epoch FROM (answer->>'snoozed_until')::timestamptz"
+        " - now()) / 86400) FROM triage_questions WHERE id = 'q-s'",
+    )
+    assert days == [("open", 7)]
+    assert _rows(sender_q, "SELECT count(*) FROM triage_email_mappings") == [(0,)]
+    assert _triage_jobs(sender_q) == []
+    ids, total, snoozed = _open_ids(client)
+    assert "q-s" not in ids and snoozed == 1 and total == len(ids)
+
+
+def test_a_snooze_ends_and_the_question_returns(client: FlaskClient, sender_q: Any) -> None:
+    _answer(client, {"scope": "later"})
+    with sender_q.cursor() as cur:
+        cur.execute(
+            "UPDATE triage_questions SET answer = jsonb_set(answer, '{snoozed_until}',"
+            " to_jsonb(now() - interval '1 minute')) WHERE id = 'q-s'"
+        )
+    sender_q.commit()
+    ids, _, snoozed = _open_ids(client)
+    assert "q-s" in ids and snoozed == 0
+
+
+def test_a_snoozed_question_can_still_be_answered(client: FlaskClient, sender_q: Any) -> None:
+    _answer(client, {"scope": "later"})
+    assert _answer(client, {"scope": "sender", "label": "Family"}).status_code == 200
+    assert _rows(
+        sender_q, "SELECT status, answer->>'scope' FROM triage_questions WHERE id = 'q-s'"
+    ) == [("answered", "sender")]
+
+
+def test_later_on_a_trash_question_keeps_the_mail_held(client: FlaskClient, conn: Any) -> None:
+    r = client.post("/triage/questions/q-a/answer", json={"scope": "later"}, headers=BY)
+    assert r.status_code == 200
+    assert _rows(conn, "SELECT status FROM triage_trash_queue WHERE from_addr = 'a@x.com'") == [
+        ("pending",),
+        ("pending",),
+    ]
+    assert _labeling(conn) == []
+    assert "q-a" not in _open_ids(client)[0]
+
+
+def test_later_needs_an_open_question(client: FlaskClient, conn: Any) -> None:
+    assert (
+        client.post("/triage/questions/q-x/answer", json={"scope": "later"}, headers=BY).status_code
+        == 404
+    )
+    client.post("/triage/questions/q-b/answer", json={"scope": "ignore"}, headers=BY)
+    assert (
+        client.post("/triage/questions/q-b/answer", json={"scope": "later"}, headers=BY).status_code
+        == 404
+    )

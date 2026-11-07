@@ -195,3 +195,15 @@ The triage worker opens the questions (`cortex-triage` `services/questions.py`, 
 7. **§3.5 is out of date on two routes.** `src/gateway/auth.py` is the source of truth for the allowlist, and it now allows two routes §3.5 excludes:
    - `POST /triage/rerun` without `preview=1`, because Devon decided the UI may start a real rerun (kp9.3).
    - `DELETE /queue/failed/<id>`, because it names a single id and refuses any row whose status is not `failed`.
+
+---
+
+## v1.3: `scope: "later"` (gateway-b874)
+
+Devon wants to put off a question he isn't ready to answer, without `ignore`, which means "never ask again".
+
+- **`POST /triage/questions/<id>/answer`** with body `{"scope":"later"}` (no other fields) returns `200 {"answered":"<id>","scope":"later","snoozed_until":"<ISO 8601>","mapping_id":null,"rows_enqueued":0}`.
+  - It snoozes the question for 7 days. It writes no label, no mapping and no re-triage, and any mail a trash question is holding stays held.
+  - It works on every kind. 404 if the id is unknown or already answered.
+- **`GET /triage/questions?status=open`** leaves snoozed questions out until `snoozed_until` passes, then lists them again. `total` counts only the listed questions. A new top-level field, **`snoozed`**, counts the open questions currently hidden.
+- A snoozed question is still open: it can be answered with any scope at any time, and a second `later` restarts the 7 days.
